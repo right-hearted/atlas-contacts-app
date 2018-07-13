@@ -1710,7 +1710,6 @@ func DefaultListNetwork(ctx context.Context, db *gorm1.DB, req interface{}) ([]*
 	if err := db.Find(&ormResponse).Error; err != nil {
 		return nil, err
 	}
-	fmt.Println(ormResponse)
 	pbResponse := []*Network{}
 	for _, responseEntry := range ormResponse {
 		temp, err := responseEntry.ToPB(ctx)

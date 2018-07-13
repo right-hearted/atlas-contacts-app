@@ -1,6 +1,7 @@
 package pb
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/infobloxopen/atlas-app-toolkit/query"
@@ -154,12 +155,22 @@ func (m *ContactsDefaultServer) CustomList(ctx context.Context, in *ListContactR
 	return &ListContactsResponse{Results: res}, nil
 }
 
+// CustomListFixed returns list of fixed ip addresses for specified network
+func (m *NetworksDefaultServer) CustomListFixed(ctx context.Context, req *ListFixedRequest) (*ListFixedResponse, error) {
+	res := []*IPv4{}
+	id := fmt.Sprintf("%v", req.Id)
+	m.DB.Where("network_id = ?", id).Find(&res)
+	return &ListFixedResponse{Results: res}, nil
+}
+
+// CustomList preloads "Fixed" field to fill response
 func (m *NetworksDefaultServer) CustomList(ctx context.Context, in *ListNetworksRequest) (*ListNetworksResponse, error) {
 	db := m.DB.Preload("Fixed")
 	res, err := DefaultListNetwork(ctx, db, in)
 	return &ListNetworksResponse{Results: res}, err
 }
 
+// CustomRead preloads "Fixed" field to fill response
 func (m *NetworksDefaultServer) CustomRead(ctx context.Context, in *ReadNetworkRequest) (*ReadNetworkResponse, error) {
 	db := m.DB.Preload("Fixed")
 	res, err := DefaultReadNetwork(ctx, &Network{Id: in.Id}, db)

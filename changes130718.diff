@@ -1,0 +1,31 @@
+diff --git a/pkg/pb/contacts.override.gorm.go b/pkg/pb/contacts.override.gorm.go
+index e900d22..821358b 100644
+--- a/pkg/pb/contacts.override.gorm.go
++++ b/pkg/pb/contacts.override.gorm.go
+@@ -154,12 +154,14 @@ func (m *ContactsDefaultServer) CustomList(ctx context.Context, in *ListContactR
+ 	return &ListContactsResponse{Results: res}, nil
+ }
+ 
++// CustomList preloads "Fixed" field to fill response
+ func (m *NetworksDefaultServer) CustomList(ctx context.Context, in *ListNetworksRequest) (*ListNetworksResponse, error) {
+ 	db := m.DB.Preload("Fixed")
+ 	res, err := DefaultListNetwork(ctx, db, in)
+ 	return &ListNetworksResponse{Results: res}, err
+ }
+ 
++// CustomRead preloads "Fixed" field to fill response
+ func (m *NetworksDefaultServer) CustomRead(ctx context.Context, in *ReadNetworkRequest) (*ReadNetworkResponse, error) {
+ 	db := m.DB.Preload("Fixed")
+ 	res, err := DefaultReadNetwork(ctx, &Network{Id: in.Id}, db)
+diff --git a/pkg/pb/contacts.pb.gorm.go b/pkg/pb/contacts.pb.gorm.go
+index 5c832d4..4cddf3f 100644
+--- a/pkg/pb/contacts.pb.gorm.go
++++ b/pkg/pb/contacts.pb.gorm.go
+@@ -1710,7 +1710,6 @@ func DefaultListNetwork(ctx context.Context, db *gorm1.DB, req interface{}) ([]*
+ 	if err := db.Find(&ormResponse).Error; err != nil {
+ 		return nil, err
+ 	}
+-	fmt.Println(ormResponse)
+ 	pbResponse := []*Network{}
+ 	for _, responseEntry := range ormResponse {
+ 		temp, err := responseEntry.ToPB(ctx)

@@ -154,6 +154,18 @@ func (m *ContactsDefaultServer) CustomList(ctx context.Context, in *ListContactR
 	return &ListContactsResponse{Results: res}, nil
 }
 
+func (m *NetworksDefaultServer) CustomList(ctx context.Context, in *ListNetworksRequest) (*ListNetworksResponse, error) {
+	db := m.DB.Preload("Fixed")
+	res, err := DefaultListNetwork(ctx, db, in)
+	return &ListNetworksResponse{Results: res}, err
+}
+
+func (m *NetworksDefaultServer) CustomRead(ctx context.Context, in *ReadNetworkRequest) (*ReadNetworkResponse, error) {
+	db := m.DB.Preload("Fixed")
+	res, err := DefaultReadNetwork(ctx, &Network{Id: in.Id}, db)
+	return &ReadNetworkResponse{Result: res}, err
+}
+
 // callback function for IterateFiltering to support "primary_email" (synthetic field) filtering
 func supportSynteticFields() FilteringIteratorCallback {
 	syntheticFound := false

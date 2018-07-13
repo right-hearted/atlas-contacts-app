@@ -278,7 +278,6 @@ message ListContactRequest {
     infoblox.api.Pagination paging = 4;
 }
 
-
 service Contacts {
     option (gorm.server).autogen = true;
     rpc Create (CreateContactRequest) returns (CreateContactResponse) {
@@ -328,13 +327,13 @@ message Network {
         multi_account: true
     };
     atlas.rpc.Identifier id = 1 [(gorm.field).tag = {type: "serial"  primary_key: true}];
-    string addr = 2 [(validate.rules).string.ipv4 = true];
+    string addr = 2  [(validate.rules).string.ipv4 = true];
     int32 cidr = 3 [(validate.rules).int32 = {gte:0, lte:32}];
-    repeated StaticIP fixed = 4;
+    repeated IPv4 fixed = 4;
     string comment = 5;
 }
 
-message StaticIP {
+message IPv4 {
     option (gorm.opts) = {
         ormable: true,
         multi_account: true
@@ -375,14 +374,10 @@ message ListNetworksResponse {
 }
 
 message ListNetworksRequest {
-    infoblox.api.Filtering filter = 1;
-    infoblox.api.Sorting order_by = 2;
-    infoblox.api.FieldSelection fields = 3;
-    infoblox.api.Pagination paging = 4;
 }
 
 message ListFixedResponse {
-    repeated string results = 1;
+    repeated IPv4 results = 1;
 }
 
 message ListFixedRequest {

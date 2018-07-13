@@ -137,7 +137,7 @@ func ServeExternal(logger *logrus.Logger) error {
 			// solution that uses database migration files.
 			logger.Debug("migrating database...")
 			defer logger.Debug("finished migrating database")
-			return db.AutoMigrate(&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{}, &pb.NetworkORM{}, &pb.StaticIPORM{}).Error
+			return db.AutoMigrate(&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{}, &pb.NetworkORM{}, &pb.IPv4ORM{}).Error
 		}),
 		// register our grpc server
 		server.WithGrpcServer(grpcServer),

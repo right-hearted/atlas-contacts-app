@@ -2300,15 +2300,15 @@ func (e NetworkValidationError) Error() string {
 
 var _ error = NetworkValidationError{}
 
-// Validate checks the field values on StaticIP with the rules defined in the
-// proto definition for this message. If any rules are violated, an error is returned.
-func (m *StaticIP) Validate() error {
+// Validate checks the field values on IPv4 with the rules defined in the proto
+// definition for this message. If any rules are violated, an error is returned.
+func (m *IPv4) Validate() error {
 	if m == nil {
 		return nil
 	}
 
 	if ip := net.ParseIP(m.GetAddr()); ip == nil || ip.To4() == nil {
-		return StaticIPValidationError{
+		return IPv4ValidationError{
 			Field:  "Addr",
 			Reason: "value must be a valid IPv4 address",
 		}
@@ -2317,9 +2317,9 @@ func (m *StaticIP) Validate() error {
 	return nil
 }
 
-// StaticIPValidationError is the validation error returned by
-// StaticIP.Validate if the designated constraints aren't met.
-type StaticIPValidationError struct {
+// IPv4ValidationError is the validation error returned by IPv4.Validate if the
+// designated constraints aren't met.
+type IPv4ValidationError struct {
 	Field  string
 	Reason string
 	Cause  error
@@ -2327,7 +2327,7 @@ type StaticIPValidationError struct {
 }
 
 // Error satisfies the builtin error interface
-func (e StaticIPValidationError) Error() string {
+func (e IPv4ValidationError) Error() string {
 	cause := ""
 	if e.Cause != nil {
 		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
@@ -2339,14 +2339,14 @@ func (e StaticIPValidationError) Error() string {
 	}
 
 	return fmt.Sprintf(
-		"invalid %sStaticIP.%s: %s%s",
+		"invalid %sIPv4.%s: %s%s",
 		key,
 		e.Field,
 		e.Reason,
 		cause)
 }
 
-var _ error = StaticIPValidationError{}
+var _ error = IPv4ValidationError{}
 
 // Validate checks the field values on CreateNetworkRequest with the rules
 // defined in the proto definition for this message. If any rules are
@@ -2793,54 +2793,6 @@ func (m *ListNetworksRequest) Validate() error {
 		return nil
 	}
 
-	if v, ok := interface{}(m.GetFilter()).(interface {
-		Validate() error
-	}); ok {
-		if err := v.Validate(); err != nil {
-			return ListNetworksRequestValidationError{
-				Field:  "Filter",
-				Reason: "embedded message failed validation",
-				Cause:  err,
-			}
-		}
-	}
-
-	if v, ok := interface{}(m.GetOrderBy()).(interface {
-		Validate() error
-	}); ok {
-		if err := v.Validate(); err != nil {
-			return ListNetworksRequestValidationError{
-				Field:  "OrderBy",
-				Reason: "embedded message failed validation",
-				Cause:  err,
-			}
-		}
-	}
-
-	if v, ok := interface{}(m.GetFields()).(interface {
-		Validate() error
-	}); ok {
-		if err := v.Validate(); err != nil {
-			return ListNetworksRequestValidationError{
-				Field:  "Fields",
-				Reason: "embedded message failed validation",
-				Cause:  err,
-			}
-		}
-	}
-
-	if v, ok := interface{}(m.GetPaging()).(interface {
-		Validate() error
-	}); ok {
-		if err := v.Validate(); err != nil {
-			return ListNetworksRequestValidationError{
-				Field:  "Paging",
-				Reason: "embedded message failed validation",
-				Cause:  err,
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -2881,6 +2833,23 @@ var _ error = ListNetworksRequestValidationError{}
 func (m *ListFixedResponse) Validate() error {
 	if m == nil {
 		return nil
+	}
+
+	for idx, item := range m.GetResults() {
+		_, _ = idx, item
+
+		if v, ok := interface{}(item).(interface {
+			Validate() error
+		}); ok {
+			if err := v.Validate(); err != nil {
+				return ListFixedResponseValidationError{
+					Field:  fmt.Sprintf("Results[%v]", idx),
+					Reason: "embedded message failed validation",
+					Cause:  err,
+				}
+			}
+		}
+
 	}
 
 	return nil

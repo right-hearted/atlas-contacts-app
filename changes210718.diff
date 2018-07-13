@@ -1,0 +1,2745 @@
+diff --git a/cmd/server/grpc.go b/cmd/server/grpc.go
+index 49ce647..161a9fb 100644
+--- a/cmd/server/grpc.go
++++ b/cmd/server/grpc.go
+@@ -2,9 +2,12 @@ package main
+ 
+ import (
+ 	"github.com/grpc-ecosystem/go-grpc-middleware"
++	"github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
+ 	"github.com/grpc-ecosystem/go-grpc-middleware/validator"
+ 	toolkit_auth "github.com/infobloxopen/atlas-app-toolkit/auth"
++	"github.com/infobloxopen/atlas-app-toolkit/errors"
+ 	"github.com/infobloxopen/atlas-app-toolkit/gateway"
++	"github.com/infobloxopen/atlas-app-toolkit/requestid"
+ 	"github.com/infobloxopen/atlas-contacts-app/cmd"
+ 	"github.com/infobloxopen/atlas-contacts-app/pkg/pb"
+ 	"github.com/infobloxopen/atlas-contacts-app/pkg/svc"
+@@ -12,9 +15,6 @@ import (
+ 	_ "github.com/jinzhu/gorm/dialects/postgres"
+ 	"github.com/sirupsen/logrus"
+ 	"google.golang.org/grpc"
+-	"github.com/infobloxopen/atlas-app-toolkit/requestid"
+-	"github.com/infobloxopen/atlas-app-toolkit/errors"
+-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
+ )
+ 
+ func NewGRPCServer(logger *logrus.Logger, db *gorm.DB) (*grpc.Server, error) {
+@@ -54,5 +54,11 @@ func NewGRPCServer(logger *logrus.Logger, db *gorm.DB) (*grpc.Server, error) {
+ 	}
+ 	pb.RegisterContactsServer(grpcServer, cs)
+ 
++	ns, err := svc.NewNetworksServer(db)
++	if err != nil {
++		return nil, err
++	}
++	pb.RegisterNetworksServer(grpcServer, ns)
++
+ 	return grpcServer, nil
+ }
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 818ef6f..4c45dc7 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -137,14 +137,14 @@ func ServeExternal(logger *logrus.Logger) error {
+ 			// solution that uses database migration files.
+ 			logger.Debug("migrating database...")
+ 			defer logger.Debug("finished migrating database")
+-			return db.AutoMigrate(&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{}).Error
++			return db.AutoMigrate(&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{}, &pb.NetworkORM{}, &pb.StaticIPORM{}).Error
+ 		}),
+ 		// register our grpc server
+ 		server.WithGrpcServer(grpcServer),
+ 		// register the gateway to proxy to the given server address with the service registration endpoints
+ 		server.WithGateway(
+ 			gateway.WithServerAddress(ServerAddress),
+-			gateway.WithEndpointRegistration("/v1/", pb.RegisterProfilesHandlerFromEndpoint, pb.RegisterGroupsHandlerFromEndpoint, pb.RegisterContactsHandlerFromEndpoint),
++			gateway.WithEndpointRegistration("/v1/", pb.RegisterProfilesHandlerFromEndpoint, pb.RegisterGroupsHandlerFromEndpoint, pb.RegisterContactsHandlerFromEndpoint, pb.RegisterNetworksHandlerFromEndpoint),
+ 		),
+ 		// serve swagger at the root
+ 		server.WithHandler("/swagger", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+diff --git a/db/migrate.go b/db/migrate.go
+index 22627e9..e19710e 100644
+--- a/db/migrate.go
++++ b/db/migrate.go
+@@ -19,6 +19,6 @@ func MigrateDB(dbSQL sql.DB) error {
+ 	// database schema. The atlas-app-toolkit team will come up with a better
+ 	// solution that uses database migration files.
+ 	return db.AutoMigrate(
+-		&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{},
++		&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{}, &pb.NetworkORM{},
+ 	).Error
+ }
+diff --git a/pkg/pb/contacts.overwrite.pb.gw.go b/pkg/pb/contacts.overwrite.pb.gw.go
+index 51eb95a..ddb3152 100644
+--- a/pkg/pb/contacts.overwrite.pb.gw.go
++++ b/pkg/pb/contacts.overwrite.pb.gw.go
+@@ -35,5 +35,15 @@ func init() {
+ 
+ 	forward_Contacts_List_0 = gateway.ForwardResponseMessage
+ 
+-	forward_Contacts_SendSMS_0 = gateway.ForwardResponseMessage
++	forward_Networks_Create_0 = gateway.ForwardResponseMessage
++
++	forward_Networks_Read_0 = gateway.ForwardResponseMessage
++
++	forward_Networks_Update_0 = gateway.ForwardResponseMessage
++
++	forward_Networks_Delete_0 = gateway.ForwardResponseMessage
++
++	forward_Networks_List_0 = gateway.ForwardResponseMessage
++
++	forward_Networks_ListFixed_0 = gateway.ForwardResponseMessage
+ }
+diff --git a/pkg/pb/contacts.pb.go b/pkg/pb/contacts.pb.go
+index 70ff06f..dd01187 100644
+--- a/pkg/pb/contacts.pb.go
++++ b/pkg/pb/contacts.pb.go
+@@ -41,6 +41,19 @@ It has these top-level messages:
+ 	ListContactsResponse
+ 	SMSRequest
+ 	ListContactRequest
++	Network
++	StaticIP
++	CreateNetworkRequest
++	CreateNetworkResponse
++	ReadNetworkRequest
++	ReadNetworkResponse
++	UpdateNetworkRequest
++	UpdateNetworkResponse
++	DeleteNetworkRequest
++	ListNetworksResponse
++	ListNetworksRequest
++	ListFixedResponse
++	ListFixedRequest
+ */
+ package pb
+ 
+@@ -889,6 +902,270 @@ func (m *ListContactRequest) GetPaging() *infoblox_api.Pagination {
+ 	return nil
+ }
+ 
++type Network struct {
++	Id      *atlas_rpc.Identifier `protobuf:"bytes,1,opt,name=id" json:"id,omitempty"`
++	Addr    string                `protobuf:"bytes,2,opt,name=addr" json:"addr,omitempty"`
++	Cidr    int32                 `protobuf:"varint,3,opt,name=cidr" json:"cidr,omitempty"`
++	Fixed   []*StaticIP           `protobuf:"bytes,4,rep,name=fixed" json:"fixed,omitempty"`
++	Comment string                `protobuf:"bytes,5,opt,name=comment" json:"comment,omitempty"`
++}
++
++func (m *Network) Reset()                    { *m = Network{} }
++func (m *Network) String() string            { return proto.CompactTextString(m) }
++func (*Network) ProtoMessage()               {}
++func (*Network) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{33} }
++
++func (m *Network) GetId() *atlas_rpc.Identifier {
++	if m != nil {
++		return m.Id
++	}
++	return nil
++}
++
++func (m *Network) GetAddr() string {
++	if m != nil {
++		return m.Addr
++	}
++	return ""
++}
++
++func (m *Network) GetCidr() int32 {
++	if m != nil {
++		return m.Cidr
++	}
++	return 0
++}
++
++func (m *Network) GetFixed() []*StaticIP {
++	if m != nil {
++		return m.Fixed
++	}
++	return nil
++}
++
++func (m *Network) GetComment() string {
++	if m != nil {
++		return m.Comment
++	}
++	return ""
++}
++
++type StaticIP struct {
++	Addr string `protobuf:"bytes,1,opt,name=addr" json:"addr,omitempty"`
++}
++
++func (m *StaticIP) Reset()                    { *m = StaticIP{} }
++func (m *StaticIP) String() string            { return proto.CompactTextString(m) }
++func (*StaticIP) ProtoMessage()               {}
++func (*StaticIP) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{34} }
++
++func (m *StaticIP) GetAddr() string {
++	if m != nil {
++		return m.Addr
++	}
++	return ""
++}
++
++type CreateNetworkRequest struct {
++	Payload *Network `protobuf:"bytes,1,opt,name=payload" json:"payload,omitempty"`
++}
++
++func (m *CreateNetworkRequest) Reset()                    { *m = CreateNetworkRequest{} }
++func (m *CreateNetworkRequest) String() string            { return proto.CompactTextString(m) }
++func (*CreateNetworkRequest) ProtoMessage()               {}
++func (*CreateNetworkRequest) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{35} }
++
++func (m *CreateNetworkRequest) GetPayload() *Network {
++	if m != nil {
++		return m.Payload
++	}
++	return nil
++}
++
++type CreateNetworkResponse struct {
++	Result *Network `protobuf:"bytes,1,opt,name=result" json:"result,omitempty"`
++}
++
++func (m *CreateNetworkResponse) Reset()                    { *m = CreateNetworkResponse{} }
++func (m *CreateNetworkResponse) String() string            { return proto.CompactTextString(m) }
++func (*CreateNetworkResponse) ProtoMessage()               {}
++func (*CreateNetworkResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{36} }
++
++func (m *CreateNetworkResponse) GetResult() *Network {
++	if m != nil {
++		return m.Result
++	}
++	return nil
++}
++
++type ReadNetworkRequest struct {
++	Id *atlas_rpc.Identifier `protobuf:"bytes,1,opt,name=id" json:"id,omitempty"`
++}
++
++func (m *ReadNetworkRequest) Reset()                    { *m = ReadNetworkRequest{} }
++func (m *ReadNetworkRequest) String() string            { return proto.CompactTextString(m) }
++func (*ReadNetworkRequest) ProtoMessage()               {}
++func (*ReadNetworkRequest) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{37} }
++
++func (m *ReadNetworkRequest) GetId() *atlas_rpc.Identifier {
++	if m != nil {
++		return m.Id
++	}
++	return nil
++}
++
++type ReadNetworkResponse struct {
++	Result *Network `protobuf:"bytes,1,opt,name=result" json:"result,omitempty"`
++}
++
++func (m *ReadNetworkResponse) Reset()                    { *m = ReadNetworkResponse{} }
++func (m *ReadNetworkResponse) String() string            { return proto.CompactTextString(m) }
++func (*ReadNetworkResponse) ProtoMessage()               {}
++func (*ReadNetworkResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{38} }
++
++func (m *ReadNetworkResponse) GetResult() *Network {
++	if m != nil {
++		return m.Result
++	}
++	return nil
++}
++
++type UpdateNetworkRequest struct {
++	Payload *Network `protobuf:"bytes,1,opt,name=payload" json:"payload,omitempty"`
++}
++
++func (m *UpdateNetworkRequest) Reset()                    { *m = UpdateNetworkRequest{} }
++func (m *UpdateNetworkRequest) String() string            { return proto.CompactTextString(m) }
++func (*UpdateNetworkRequest) ProtoMessage()               {}
++func (*UpdateNetworkRequest) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{39} }
++
++func (m *UpdateNetworkRequest) GetPayload() *Network {
++	if m != nil {
++		return m.Payload
++	}
++	return nil
++}
++
++type UpdateNetworkResponse struct {
++	Result *Network `protobuf:"bytes,1,opt,name=result" json:"result,omitempty"`
++}
++
++func (m *UpdateNetworkResponse) Reset()                    { *m = UpdateNetworkResponse{} }
++func (m *UpdateNetworkResponse) String() string            { return proto.CompactTextString(m) }
++func (*UpdateNetworkResponse) ProtoMessage()               {}
++func (*UpdateNetworkResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{40} }
++
++func (m *UpdateNetworkResponse) GetResult() *Network {
++	if m != nil {
++		return m.Result
++	}
++	return nil
++}
++
++type DeleteNetworkRequest struct {
++	Id *atlas_rpc.Identifier `protobuf:"bytes,1,opt,name=id" json:"id,omitempty"`
++}
++
++func (m *DeleteNetworkRequest) Reset()                    { *m = DeleteNetworkRequest{} }
++func (m *DeleteNetworkRequest) String() string            { return proto.CompactTextString(m) }
++func (*DeleteNetworkRequest) ProtoMessage()               {}
++func (*DeleteNetworkRequest) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{41} }
++
++func (m *DeleteNetworkRequest) GetId() *atlas_rpc.Identifier {
++	if m != nil {
++		return m.Id
++	}
++	return nil
++}
++
++type ListNetworksResponse struct {
++	Results []*Network `protobuf:"bytes,1,rep,name=results" json:"results,omitempty"`
++}
++
++func (m *ListNetworksResponse) Reset()                    { *m = ListNetworksResponse{} }
++func (m *ListNetworksResponse) String() string            { return proto.CompactTextString(m) }
++func (*ListNetworksResponse) ProtoMessage()               {}
++func (*ListNetworksResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{42} }
++
++func (m *ListNetworksResponse) GetResults() []*Network {
++	if m != nil {
++		return m.Results
++	}
++	return nil
++}
++
++type ListNetworksRequest struct {
++	Filter  *infoblox_api.Filtering      `protobuf:"bytes,1,opt,name=filter" json:"filter,omitempty"`
++	OrderBy *infoblox_api.Sorting        `protobuf:"bytes,2,opt,name=order_by,json=orderBy" json:"order_by,omitempty"`
++	Fields  *infoblox_api.FieldSelection `protobuf:"bytes,3,opt,name=fields" json:"fields,omitempty"`
++	Paging  *infoblox_api.Pagination     `protobuf:"bytes,4,opt,name=paging" json:"paging,omitempty"`
++}
++
++func (m *ListNetworksRequest) Reset()                    { *m = ListNetworksRequest{} }
++func (m *ListNetworksRequest) String() string            { return proto.CompactTextString(m) }
++func (*ListNetworksRequest) ProtoMessage()               {}
++func (*ListNetworksRequest) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{43} }
++
++func (m *ListNetworksRequest) GetFilter() *infoblox_api.Filtering {
++	if m != nil {
++		return m.Filter
++	}
++	return nil
++}
++
++func (m *ListNetworksRequest) GetOrderBy() *infoblox_api.Sorting {
++	if m != nil {
++		return m.OrderBy
++	}
++	return nil
++}
++
++func (m *ListNetworksRequest) GetFields() *infoblox_api.FieldSelection {
++	if m != nil {
++		return m.Fields
++	}
++	return nil
++}
++
++func (m *ListNetworksRequest) GetPaging() *infoblox_api.Pagination {
++	if m != nil {
++		return m.Paging
++	}
++	return nil
++}
++
++type ListFixedResponse struct {
++	Results []string `protobuf:"bytes,1,rep,name=results" json:"results,omitempty"`
++}
++
++func (m *ListFixedResponse) Reset()                    { *m = ListFixedResponse{} }
++func (m *ListFixedResponse) String() string            { return proto.CompactTextString(m) }
++func (*ListFixedResponse) ProtoMessage()               {}
++func (*ListFixedResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{44} }
++
++func (m *ListFixedResponse) GetResults() []string {
++	if m != nil {
++		return m.Results
++	}
++	return nil
++}
++
++type ListFixedRequest struct {
++	Id *atlas_rpc.Identifier `protobuf:"bytes,1,opt,name=id" json:"id,omitempty"`
++}
++
++func (m *ListFixedRequest) Reset()                    { *m = ListFixedRequest{} }
++func (m *ListFixedRequest) String() string            { return proto.CompactTextString(m) }
++func (*ListFixedRequest) ProtoMessage()               {}
++func (*ListFixedRequest) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{45} }
++
++func (m *ListFixedRequest) GetId() *atlas_rpc.Identifier {
++	if m != nil {
++		return m.Id
++	}
++	return nil
++}
++
+ func init() {
+ 	proto.RegisterType((*Profile)(nil), "api.contacts.Profile")
+ 	proto.RegisterType((*CreateProfileRequest)(nil), "api.contacts.CreateProfileRequest")
+@@ -923,6 +1200,19 @@ func init() {
+ 	proto.RegisterType((*ListContactsResponse)(nil), "api.contacts.ListContactsResponse")
+ 	proto.RegisterType((*SMSRequest)(nil), "api.contacts.SMSRequest")
+ 	proto.RegisterType((*ListContactRequest)(nil), "api.contacts.ListContactRequest")
++	proto.RegisterType((*Network)(nil), "api.contacts.Network")
++	proto.RegisterType((*StaticIP)(nil), "api.contacts.StaticIP")
++	proto.RegisterType((*CreateNetworkRequest)(nil), "api.contacts.CreateNetworkRequest")
++	proto.RegisterType((*CreateNetworkResponse)(nil), "api.contacts.CreateNetworkResponse")
++	proto.RegisterType((*ReadNetworkRequest)(nil), "api.contacts.ReadNetworkRequest")
++	proto.RegisterType((*ReadNetworkResponse)(nil), "api.contacts.ReadNetworkResponse")
++	proto.RegisterType((*UpdateNetworkRequest)(nil), "api.contacts.UpdateNetworkRequest")
++	proto.RegisterType((*UpdateNetworkResponse)(nil), "api.contacts.UpdateNetworkResponse")
++	proto.RegisterType((*DeleteNetworkRequest)(nil), "api.contacts.DeleteNetworkRequest")
++	proto.RegisterType((*ListNetworksResponse)(nil), "api.contacts.ListNetworksResponse")
++	proto.RegisterType((*ListNetworksRequest)(nil), "api.contacts.ListNetworksRequest")
++	proto.RegisterType((*ListFixedResponse)(nil), "api.contacts.ListFixedResponse")
++	proto.RegisterType((*ListFixedRequest)(nil), "api.contacts.ListFixedRequest")
+ }
+ 
+ // Reference imports to suppress errors if they are not otherwise used.
+@@ -1554,117 +1844,364 @@ var _Contacts_serviceDesc = grpc.ServiceDesc{
+ 	Metadata: "github.com/infobloxopen/atlas-contacts-app/pkg/pb/contacts.proto",
+ }
+ 
++// Client API for Networks service
++
++type NetworksClient interface {
++	Create(ctx context.Context, in *CreateNetworkRequest, opts ...grpc.CallOption) (*CreateNetworkResponse, error)
++	Read(ctx context.Context, in *ReadNetworkRequest, opts ...grpc.CallOption) (*ReadNetworkResponse, error)
++	Update(ctx context.Context, in *UpdateNetworkRequest, opts ...grpc.CallOption) (*UpdateNetworkResponse, error)
++	Delete(ctx context.Context, in *DeleteNetworkRequest, opts ...grpc.CallOption) (*google_protobuf.Empty, error)
++	ListFixed(ctx context.Context, in *ListFixedRequest, opts ...grpc.CallOption) (*ListFixedResponse, error)
++	List(ctx context.Context, in *ListNetworksRequest, opts ...grpc.CallOption) (*ListNetworksResponse, error)
++}
++
++type networksClient struct {
++	cc *grpc.ClientConn
++}
++
++func NewNetworksClient(cc *grpc.ClientConn) NetworksClient {
++	return &networksClient{cc}
++}
++
++func (c *networksClient) Create(ctx context.Context, in *CreateNetworkRequest, opts ...grpc.CallOption) (*CreateNetworkResponse, error) {
++	out := new(CreateNetworkResponse)
++	err := grpc.Invoke(ctx, "/api.contacts.Networks/Create", in, out, c.cc, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *networksClient) Read(ctx context.Context, in *ReadNetworkRequest, opts ...grpc.CallOption) (*ReadNetworkResponse, error) {
++	out := new(ReadNetworkResponse)
++	err := grpc.Invoke(ctx, "/api.contacts.Networks/Read", in, out, c.cc, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *networksClient) Update(ctx context.Context, in *UpdateNetworkRequest, opts ...grpc.CallOption) (*UpdateNetworkResponse, error) {
++	out := new(UpdateNetworkResponse)
++	err := grpc.Invoke(ctx, "/api.contacts.Networks/Update", in, out, c.cc, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *networksClient) Delete(ctx context.Context, in *DeleteNetworkRequest, opts ...grpc.CallOption) (*google_protobuf.Empty, error) {
++	out := new(google_protobuf.Empty)
++	err := grpc.Invoke(ctx, "/api.contacts.Networks/Delete", in, out, c.cc, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *networksClient) ListFixed(ctx context.Context, in *ListFixedRequest, opts ...grpc.CallOption) (*ListFixedResponse, error) {
++	out := new(ListFixedResponse)
++	err := grpc.Invoke(ctx, "/api.contacts.Networks/ListFixed", in, out, c.cc, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *networksClient) List(ctx context.Context, in *ListNetworksRequest, opts ...grpc.CallOption) (*ListNetworksResponse, error) {
++	out := new(ListNetworksResponse)
++	err := grpc.Invoke(ctx, "/api.contacts.Networks/List", in, out, c.cc, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// Server API for Networks service
++
++type NetworksServer interface {
++	Create(context.Context, *CreateNetworkRequest) (*CreateNetworkResponse, error)
++	Read(context.Context, *ReadNetworkRequest) (*ReadNetworkResponse, error)
++	Update(context.Context, *UpdateNetworkRequest) (*UpdateNetworkResponse, error)
++	Delete(context.Context, *DeleteNetworkRequest) (*google_protobuf.Empty, error)
++	ListFixed(context.Context, *ListFixedRequest) (*ListFixedResponse, error)
++	List(context.Context, *ListNetworksRequest) (*ListNetworksResponse, error)
++}
++
++func RegisterNetworksServer(s *grpc.Server, srv NetworksServer) {
++	s.RegisterService(&_Networks_serviceDesc, srv)
++}
++
++func _Networks_Create_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(CreateNetworkRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(NetworksServer).Create(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.contacts.Networks/Create",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(NetworksServer).Create(ctx, req.(*CreateNetworkRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Networks_Read_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(ReadNetworkRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(NetworksServer).Read(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.contacts.Networks/Read",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(NetworksServer).Read(ctx, req.(*ReadNetworkRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Networks_Update_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UpdateNetworkRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(NetworksServer).Update(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.contacts.Networks/Update",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(NetworksServer).Update(ctx, req.(*UpdateNetworkRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Networks_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(DeleteNetworkRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(NetworksServer).Delete(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.contacts.Networks/Delete",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(NetworksServer).Delete(ctx, req.(*DeleteNetworkRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Networks_ListFixed_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(ListFixedRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(NetworksServer).ListFixed(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.contacts.Networks/ListFixed",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(NetworksServer).ListFixed(ctx, req.(*ListFixedRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _Networks_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(ListNetworksRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(NetworksServer).List(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.contacts.Networks/List",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(NetworksServer).List(ctx, req.(*ListNetworksRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++var _Networks_serviceDesc = grpc.ServiceDesc{
++	ServiceName: "api.contacts.Networks",
++	HandlerType: (*NetworksServer)(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "Create",
++			Handler:    _Networks_Create_Handler,
++		},
++		{
++			MethodName: "Read",
++			Handler:    _Networks_Read_Handler,
++		},
++		{
++			MethodName: "Update",
++			Handler:    _Networks_Update_Handler,
++		},
++		{
++			MethodName: "Delete",
++			Handler:    _Networks_Delete_Handler,
++		},
++		{
++			MethodName: "ListFixed",
++			Handler:    _Networks_ListFixed_Handler,
++		},
++		{
++			MethodName: "List",
++			Handler:    _Networks_List_Handler,
++		},
++	},
++	Streams:  []grpc.StreamDesc{},
++	Metadata: "github.com/infobloxopen/atlas-contacts-app/pkg/pb/contacts.proto",
++}
++
+ func init() {
+ 	proto.RegisterFile("github.com/infobloxopen/atlas-contacts-app/pkg/pb/contacts.proto", fileDescriptor0)
+ }
+ 
+ var fileDescriptor0 = []byte{
+-	// 1697 bytes of a gzipped FileDescriptorProto
+-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xdc, 0x59, 0x4d, 0x6f, 0xdb, 0x46,
+-	0x1a, 0x0e, 0x65, 0x59, 0x1f, 0xaf, 0x1d, 0xc7, 0x99, 0x38, 0x09, 0xad, 0x38, 0x89, 0xc2, 0xc5,
+-	0x02, 0x81, 0xbd, 0x12, 0x1d, 0xc5, 0xfb, 0x11, 0x1b, 0x0b, 0x24, 0x72, 0x3e, 0x90, 0x60, 0x93,
+-	0x0d, 0x24, 0xec, 0x02, 0x1b, 0x60, 0xa1, 0xa5, 0xc4, 0xb1, 0x3c, 0x31, 0xc5, 0x61, 0x48, 0x6a,
+-	0xb3, 0xda, 0x22, 0x40, 0xd1, 0x02, 0xfd, 0x01, 0xed, 0xa5, 0x87, 0xfe, 0x87, 0x1e, 0x7a, 0xb2,
+-	0x4e, 0xfd, 0x0d, 0x4d, 0xaf, 0x45, 0x2f, 0xbd, 0xf4, 0x47, 0x14, 0x28, 0x38, 0x1f, 0x14, 0x49,
+-	0x51, 0xb2, 0xac, 0xa4, 0x97, 0x5c, 0x0c, 0x92, 0xf3, 0x7e, 0xcf, 0xf3, 0x3e, 0xf3, 0x8e, 0x0c,
+-	0x77, 0xbb, 0xc4, 0x3f, 0xec, 0xb7, 0xab, 0x1d, 0xda, 0xd3, 0x89, 0x7d, 0x40, 0xdb, 0x16, 0xfd,
+-	0x1f, 0x75, 0xb0, 0xad, 0x1b, 0xbe, 0x65, 0x78, 0x95, 0x0e, 0xb5, 0x7d, 0xa3, 0xe3, 0x7b, 0x15,
+-	0xc3, 0x71, 0x74, 0xe7, 0xa8, 0xab, 0x3b, 0x6d, 0x5d, 0x7e, 0xab, 0x3a, 0x2e, 0xf5, 0x29, 0x5a,
+-	0x36, 0x1c, 0x52, 0x95, 0xdf, 0x4a, 0x57, 0xba, 0x94, 0x76, 0x2d, 0xac, 0xb3, 0xb5, 0x76, 0xff,
+-	0x40, 0xc7, 0x3d, 0xc7, 0x1f, 0x70, 0xd1, 0xd2, 0x86, 0x58, 0x34, 0x1c, 0xa2, 0x1b, 0xb6, 0x4d,
+-	0x7d, 0xc3, 0x27, 0xd4, 0x16, 0x86, 0x4a, 0x7b, 0x91, 0x50, 0xac, 0xc1, 0x81, 0xcf, 0x6d, 0x74,
+-	0x2a, 0x5d, 0x6c, 0x57, 0xfe, 0x6b, 0x58, 0xc4, 0x34, 0x7c, 0xac, 0x8f, 0x3d, 0x08, 0xe5, 0x3f,
+-	0x44, 0x84, 0xbd, 0xd7, 0x46, 0xb7, 0x8b, 0x5d, 0x9d, 0x3a, 0xcc, 0x7c, 0x8a, 0xab, 0xdd, 0x49,
+-	0x59, 0x47, 0xac, 0x74, 0xa9, 0xdb, 0x0b, 0x4d, 0x04, 0x2f, 0x42, 0xf7, 0xce, 0xac, 0xba, 0xfe,
+-	0xc0, 0xc1, 0x1e, 0xff, 0x2b, 0x54, 0x9f, 0x4c, 0x2f, 0xb6, 0xe1, 0x38, 0x15, 0x9f, 0x52, 0xeb,
+-	0x88, 0xf8, 0xfa, 0xab, 0x3e, 0x76, 0x07, 0x7a, 0x87, 0x5a, 0x16, 0xee, 0x04, 0x21, 0xb4, 0xa8,
+-	0x83, 0x5d, 0xc3, 0xa7, 0xae, 0xb4, 0xf5, 0x60, 0x76, 0x5b, 0xae, 0xd3, 0xd1, 0x5d, 0xec, 0xd1,
+-	0xbe, 0xdb, 0xc1, 0xe1, 0x03, 0x37, 0xa3, 0x7d, 0xaf, 0x40, 0xfe, 0xb9, 0x4b, 0x0f, 0x88, 0x85,
+-	0xd1, 0x1f, 0x21, 0x43, 0x4c, 0x55, 0x29, 0x2b, 0x37, 0x97, 0x6a, 0x17, 0xab, 0xcc, 0x4e, 0xd5,
+-	0x75, 0x3a, 0xd5, 0xc7, 0x26, 0xb6, 0x7d, 0x72, 0x40, 0xb0, 0x5b, 0x5f, 0x19, 0x1e, 0xaf, 0x03,
+-	0x14, 0x50, 0xce, 0xc3, 0x2e, 0x31, 0xac, 0x46, 0x86, 0x98, 0x08, 0x41, 0xd6, 0x36, 0x7a, 0x58,
+-	0xcd, 0x94, 0x95, 0x9b, 0xc5, 0x06, 0x7b, 0x46, 0x6b, 0xb0, 0x68, 0x53, 0x1f, 0x7b, 0xea, 0x02,
+-	0xfb, 0xc8, 0x5f, 0xd0, 0x2d, 0x28, 0x48, 0xa0, 0xa8, 0xd9, 0xf2, 0x02, 0x77, 0x13, 0x41, 0x4f,
+-	0x75, 0x9f, 0x3f, 0x34, 0x42, 0x31, 0xb4, 0x05, 0xb9, 0xae, 0x4b, 0xfb, 0x8e, 0xa7, 0x2e, 0x32,
+-	0x85, 0x0b, 0x71, 0x85, 0x47, 0xc1, 0x5a, 0x43, 0x88, 0xec, 0x16, 0x86, 0xc7, 0xeb, 0xd9, 0x82,
+-	0x52, 0x56, 0xb4, 0x47, 0xb0, 0xb6, 0xef, 0x62, 0xc3, 0xc7, 0x22, 0xb7, 0x06, 0x7e, 0xd5, 0xc7,
+-	0x9e, 0x8f, 0x74, 0xc8, 0x3b, 0xc6, 0xc0, 0xa2, 0x46, 0x24, 0xcf, 0xa8, 0x3d, 0x29, 0x2e, 0xa5,
+-	0xb4, 0x87, 0x70, 0x31, 0x61, 0xc8, 0x73, 0xa8, 0xed, 0x61, 0x54, 0x81, 0x9c, 0x8b, 0xbd, 0xbe,
+-	0xe5, 0x4f, 0x37, 0x24, 0x84, 0xb4, 0x3d, 0x40, 0x0d, 0x6c, 0x98, 0x89, 0x70, 0x7e, 0x7f, 0x62,
+-	0xc5, 0x83, 0x0a, 0x6b, 0xf7, 0xe1, 0x42, 0x4c, 0x79, 0xbe, 0x10, 0x1e, 0xc1, 0xda, 0x3f, 0x1c,
+-	0xf3, 0xfd, 0xd4, 0x24, 0x61, 0x68, 0xbe, 0x80, 0xfe, 0x0a, 0x6b, 0xf7, 0xb1, 0x85, 0xc7, 0x02,
+-	0x9a, 0xb1, 0x2a, 0x3f, 0x2a, 0x80, 0xfe, 0x46, 0x3c, 0x7f, 0x2c, 0x9d, 0xdc, 0x01, 0xb1, 0x7c,
+-	0xec, 0x0a, 0x0b, 0x97, 0xab, 0xb2, 0x3d, 0x58, 0x34, 0x0f, 0xd9, 0x1a, 0xb1, 0xbb, 0x0d, 0x21,
+-	0x86, 0xb6, 0xa1, 0x40, 0x5d, 0x13, 0xbb, 0xad, 0xf6, 0x80, 0x61, 0x38, 0x70, 0x1a, 0x53, 0x69,
+-	0x52, 0xd7, 0x0f, 0x14, 0xf2, 0x4c, 0xac, 0x3e, 0x40, 0x3b, 0x81, 0x0b, 0x6c, 0x99, 0x1c, 0xde,
+-	0x4b, 0xb5, 0x8d, 0xa4, 0x0b, 0x6c, 0x99, 0x4d, 0x2c, 0x3a, 0xb7, 0x21, 0x64, 0xd1, 0x36, 0xe4,
+-	0x1c, 0xa3, 0x4b, 0xec, 0xae, 0x9a, 0x65, 0x5a, 0x6a, 0x5c, 0xeb, 0x79, 0xb0, 0x66, 0x70, 0x0d,
+-	0x2e, 0x17, 0xec, 0x58, 0x24, 0x41, 0x2f, 0xac, 0xb3, 0x0e, 0x79, 0x5e, 0x42, 0x4f, 0x55, 0xd2,
+-	0xda, 0x28, 0xdc, 0x31, 0x21, 0xa5, 0x7d, 0x95, 0x81, 0x45, 0xd6, 0x2a, 0xbf, 0x7d, 0x8f, 0xff,
+-	0x19, 0xf2, 0x0e, 0x77, 0x2f, 0xd2, 0x4c, 0x8f, 0xad, 0x9e, 0x1b, 0x1e, 0xaf, 0x67, 0xb4, 0x33,
+-	0x0d, 0x29, 0x8d, 0x76, 0x00, 0xc4, 0x63, 0x8b, 0x98, 0xea, 0xe2, 0xb4, 0xdd, 0x2f, 0x0a, 0xc1,
+-	0xc7, 0x26, 0xba, 0x13, 0xa1, 0x94, 0xdc, 0x14, 0x4a, 0xe1, 0xfe, 0x6a, 0x67, 0x46, 0xd4, 0x12,
+-	0x61, 0x8b, 0x7d, 0x40, 0xbc, 0xc9, 0x39, 0x9d, 0x08, 0x20, 0x55, 0x92, 0x7d, 0x91, 0xca, 0x3d,
+-	0x61, 0x57, 0xd4, 0xe1, 0x42, 0xcc, 0x88, 0xd8, 0xab, 0xad, 0x44, 0x4f, 0xa4, 0x13, 0x98, 0xe8,
+-	0x88, 0x3b, 0xb0, 0x1a, 0x34, 0x7a, 0x2c, 0x8c, 0x19, 0xbb, 0xe1, 0x2e, 0x9c, 0x8f, 0xa8, 0xce,
+-	0xe3, 0x7c, 0x1f, 0x10, 0x6f, 0xeb, 0x77, 0xac, 0x42, 0xcc, 0xc8, 0x3c, 0x81, 0xec, 0x01, 0xe2,
+-	0xbc, 0x30, 0x4f, 0x1d, 0x7e, 0x50, 0x60, 0x35, 0x68, 0x9a, 0x98, 0xee, 0x07, 0xc4, 0x09, 0xfb,
+-	0x9c, 0xf4, 0x58, 0x7a, 0x5e, 0x84, 0x79, 0x13, 0x8c, 0x90, 0xbe, 0x4b, 0x92, 0x0f, 0x7e, 0xc9,
+-	0x42, 0x5e, 0x34, 0xc6, 0xbc, 0x8c, 0x70, 0x15, 0xe0, 0x80, 0xb8, 0x9e, 0xdf, 0x8a, 0xf0, 0x42,
+-	0x91, 0x7d, 0x79, 0x16, 0x90, 0xc3, 0x75, 0x58, 0xea, 0x11, 0xd3, 0xb4, 0x30, 0x5f, 0xe7, 0x14,
+-	0x01, 0xfc, 0x13, 0x13, 0xb8, 0x02, 0x45, 0xcb, 0x90, 0xea, 0x59, 0xb6, 0x5c, 0x08, 0x3e, 0xb0,
+-	0xc5, 0x1d, 0x38, 0xeb, 0xb8, 0xa4, 0x67, 0xb8, 0x83, 0x16, 0xee, 0x19, 0xc4, 0x52, 0x73, 0x81,
+-	0x40, 0xfd, 0x5c, 0xd0, 0xc3, 0xab, 0xca, 0xf0, 0xe7, 0x6f, 0x17, 0xb2, 0x6e, 0xe6, 0x3f, 0x4a,
+-	0x63, 0x59, 0x48, 0x3d, 0x08, 0x84, 0x46, 0x84, 0x94, 0x8f, 0x12, 0xd2, 0x16, 0xe4, 0x98, 0x0d,
+-	0x4f, 0x2d, 0xa4, 0x55, 0x86, 0xa9, 0x36, 0x84, 0x08, 0xfa, 0x0b, 0x2c, 0x1f, 0xd2, 0x1e, 0x6e,
+-	0x19, 0xa6, 0xe9, 0x62, 0xcf, 0x53, 0x8b, 0x69, 0x14, 0x76, 0x8f, 0x2f, 0x36, 0x96, 0x02, 0x51,
+-	0xf1, 0x12, 0x68, 0xbe, 0xa6, 0xee, 0x51, 0xa8, 0x09, 0x53, 0x35, 0x03, 0x51, 0xa9, 0x19, 0x27,
+-	0xbe, 0xa5, 0x19, 0x89, 0x2f, 0xc2, 0xb3, 0xcb, 0xa7, 0xe2, 0xd9, 0xfd, 0x70, 0xa2, 0x3a, 0x3b,
+-	0x11, 0x29, 0xf5, 0x4b, 0xc3, 0xe3, 0x75, 0x54, 0x5b, 0x85, 0x15, 0x26, 0xda, 0x92, 0xab, 0x72,
+-	0xd2, 0x42, 0xb7, 0xa1, 0x68, 0x93, 0xce, 0x51, 0xb0, 0x79, 0x9e, 0xba, 0x22, 0xfc, 0xb3, 0x21,
+-	0x99, 0xcf, 0xbb, 0x4f, 0x9a, 0x7f, 0x7f, 0xf6, 0x4f, 0xc3, 0xea, 0xe3, 0xc6, 0x48, 0x2e, 0x42,
+-	0xb8, 0x6d, 0x58, 0xe4, 0x5b, 0xb6, 0x12, 0x82, 0x2f, 0xcb, 0x50, 0xb5, 0x05, 0x79, 0x59, 0x40,
+-	0x06, 0xa9, 0xfa, 0xf9, 0x40, 0x07, 0x32, 0xdb, 0x91, 0x4d, 0x97, 0x12, 0xbb, 0x1b, 0xc3, 0xe3,
+-	0x75, 0xb5, 0xa0, 0x04, 0x87, 0x53, 0x9b, 0x52, 0x0b, 0x01, 0xf1, 0x5a, 0x02, 0x10, 0x65, 0x45,
+-	0xfb, 0x54, 0x81, 0xbc, 0x2c, 0xb1, 0x3a, 0x32, 0xab, 0x30, 0x6c, 0xc8, 0xd7, 0x40, 0xb7, 0x43,
+-	0xfc, 0x81, 0x3c, 0xd8, 0x82, 0xe7, 0x00, 0x47, 0x9e, 0x6f, 0xf8, 0x12, 0xb5, 0xfc, 0x05, 0xad,
+-	0xc2, 0xc2, 0xff, 0x89, 0x23, 0xa0, 0x1a, 0x3c, 0x06, 0x56, 0x3b, 0xb4, 0x6f, 0xfb, 0xee, 0x80,
+-	0x1d, 0x57, 0xc5, 0x86, 0x7c, 0x4d, 0x1b, 0x44, 0xe5, 0x68, 0x3b, 0xe3, 0xd0, 0x25, 0xc5, 0xc7,
+-	0x07, 0xd1, 0xd0, 0xd0, 0x6c, 0x43, 0x97, 0x14, 0x4f, 0x0c, 0xa2, 0x89, 0x70, 0x4e, 0x37, 0x88,
+-	0xbe, 0x63, 0x08, 0xe1, 0x20, 0xfa, 0x1e, 0x6a, 0x92, 0x30, 0x34, 0x5f, 0x40, 0xe1, 0x20, 0x3a,
+-	0x5f, 0x55, 0xc4, 0x98, 0xb6, 0x2f, 0x9b, 0x64, 0xd6, 0x31, 0x2d, 0xcc, 0x47, 0xd2, 0xf2, 0x9f,
+-	0x00, 0x9a, 0x4f, 0x9b, 0xd2, 0x7b, 0xb2, 0x37, 0x54, 0xc8, 0xf7, 0xb0, 0xe7, 0x19, 0x5d, 0x49,
+-	0xb7, 0xf2, 0x35, 0x9c, 0x84, 0xc7, 0xea, 0xf9, 0xa1, 0x9c, 0x7a, 0xb5, 0xb7, 0x59, 0x28, 0xc8,
+-	0x31, 0x18, 0xf5, 0x20, 0xc7, 0x5b, 0x01, 0x69, 0x89, 0x82, 0xa6, 0x5c, 0xf9, 0x4a, 0xbf, 0x9b,
+-	0x2a, 0xc3, 0xb7, 0x4a, 0x2b, 0x7d, 0xf2, 0xf6, 0xa7, 0x2f, 0x32, 0x6b, 0x5a, 0x51, 0x17, 0x34,
+-	0xe9, 0xed, 0x4a, 0x94, 0x21, 0x0a, 0xd9, 0x00, 0xf4, 0xa8, 0x1c, 0x37, 0x34, 0x7e, 0x9d, 0x2b,
+-	0xdd, 0x98, 0x22, 0x21, 0x1c, 0x69, 0xcc, 0xd1, 0x06, 0x2a, 0x85, 0x8e, 0xf4, 0x8f, 0x88, 0x59,
+-	0x95, 0xb7, 0xf2, 0x16, 0x31, 0xdf, 0xa0, 0xcf, 0x14, 0xc8, 0x71, 0x5c, 0x27, 0x13, 0x4c, 0xbb,
+-	0xbf, 0x25, 0x13, 0x4c, 0xbd, 0x9a, 0x69, 0xb7, 0x99, 0xdf, 0x4a, 0x49, 0x8b, 0xf8, 0x15, 0x09,
+-	0x56, 0x13, 0xfe, 0x47, 0x99, 0xf7, 0x21, 0xc7, 0xfb, 0x22, 0x19, 0x47, 0xda, 0xb5, 0xad, 0x74,
+-	0xa9, 0xca, 0x7f, 0xde, 0xa9, 0xca, 0xdf, 0x7e, 0xaa, 0x0f, 0x7a, 0x8e, 0x3f, 0xd0, 0xf4, 0xe1,
+-	0xf1, 0x7a, 0x31, 0xfc, 0x95, 0x81, 0xe7, 0xbf, 0x39, 0x2d, 0xff, 0x16, 0x64, 0x03, 0x34, 0x27,
+-	0x0b, 0x3e, 0x7e, 0xd7, 0x2b, 0x69, 0x13, 0x25, 0xc2, 0x2e, 0xd4, 0xce, 0x33, 0x8f, 0x4b, 0x68,
+-	0xb4, 0xb5, 0x25, 0x76, 0x26, 0x16, 0x94, 0xda, 0x37, 0x59, 0xc8, 0xf1, 0x41, 0x0a, 0x75, 0x43,
+-	0x4c, 0x95, 0xd3, 0xf0, 0x12, 0x9d, 0x26, 0x93, 0xdb, 0x9c, 0x32, 0xf5, 0x6b, 0x2a, 0x73, 0x8a,
+-	0xb4, 0xbc, 0x2e, 0x7e, 0x9a, 0x08, 0x6b, 0x4a, 0x04, 0x9a, 0xae, 0x8d, 0x63, 0x25, 0xe6, 0xe4,
+-	0xfa, 0xc4, 0x75, 0xe1, 0xa2, 0xcc, 0x5c, 0x94, 0x90, 0x2a, 0x5c, 0x8c, 0xd7, 0xf1, 0xe3, 0x11,
+-	0x8e, 0xca, 0x69, 0x18, 0x99, 0x96, 0x54, 0xca, 0x10, 0xaf, 0xdd, 0x62, 0x1e, 0xb7, 0x4a, 0xe5,
+-	0xd0, 0xe3, 0x89, 0x08, 0xa2, 0x21, 0x82, 0xca, 0x69, 0x08, 0x8a, 0x45, 0x30, 0x09, 0x3f, 0x5b,
+-	0xc3, 0xe3, 0xf5, 0xbc, 0xb8, 0xbf, 0xf2, 0x9c, 0x37, 0x27, 0xe7, 0xfc, 0x2f, 0x81, 0x9d, 0x6b,
+-	0xe3, 0xc8, 0x88, 0x39, 0x2b, 0x4f, 0x58, 0x1f, 0xe1, 0xe6, 0x1c, 0xf3, 0x55, 0x44, 0x72, 0x0b,
+-	0x43, 0xd4, 0x7c, 0xbd, 0x08, 0x05, 0xc9, 0xf5, 0x27, 0x71, 0x51, 0x9c, 0x91, 0xd3, 0xb9, 0x28,
+-	0x71, 0x78, 0x45, 0xb8, 0x28, 0xbc, 0xaa, 0xce, 0xc2, 0x45, 0x09, 0x57, 0x37, 0xa6, 0x48, 0x8c,
+-	0x71, 0x91, 0x14, 0x3b, 0x3d, 0x17, 0x4d, 0x4f, 0x30, 0xf5, 0x74, 0x8e, 0x70, 0xd1, 0xc8, 0xef,
+-	0xbb, 0x72, 0x51, 0x22, 0x8e, 0x13, 0xb8, 0x48, 0x48, 0x87, 0x5c, 0x34, 0x39, 0xff, 0x29, 0x5c,
+-	0x94, 0x70, 0xa9, 0x4d, 0x94, 0x48, 0xe3, 0xa2, 0xf0, 0x07, 0xce, 0x17, 0x90, 0x6f, 0x62, 0xdb,
+-	0x6c, 0x3e, 0x6d, 0x22, 0x35, 0x6e, 0x61, 0x34, 0x0a, 0x4c, 0x4c, 0xe7, 0x2a, 0xb3, 0x77, 0x59,
+-	0x43, 0xb1, 0x0c, 0xde, 0xe8, 0x5e, 0xcf, 0xdb, 0x55, 0x36, 0x25, 0x62, 0xeb, 0xdf, 0x29, 0x9f,
+-	0xdf, 0xfb, 0x52, 0x41, 0xf6, 0x08, 0xb7, 0xda, 0xbf, 0x61, 0xe5, 0x09, 0x3d, 0xb4, 0xcb, 0x75,
+-	0x6c, 0x19, 0x3d, 0xc3, 0x25, 0x1d, 0x54, 0x3b, 0xf4, 0x7d, 0xc7, 0xdb, 0xd5, 0xf5, 0xd9, 0xff,
+-	0x23, 0x50, 0xba, 0xfc, 0xb2, 0x2d, 0xf5, 0xef, 0x86, 0x47, 0x78, 0x87, 0xf6, 0x6a, 0x0b, 0xb7,
+-	0xaa, 0xdb, 0x9b, 0x19, 0x25, 0x53, 0x5b, 0x35, 0x1c, 0xc7, 0x22, 0x1d, 0x76, 0x9a, 0xeb, 0x2f,
+-	0x3d, 0x6a, 0xef, 0x8e, 0x7d, 0x79, 0xb1, 0x73, 0xea, 0xff, 0x41, 0xec, 0x39, 0xed, 0x76, 0x8e,
+-	0xd5, 0xe2, 0xf6, 0xaf, 0x01, 0x00, 0x00, 0xff, 0xff, 0xd2, 0xa1, 0x0c, 0x15, 0xc2, 0x18, 0x00,
++	// 1985 bytes of a gzipped FileDescriptorProto
++	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xdc, 0x59, 0x4d, 0x8f, 0xdb, 0xc6,
++	0x19, 0x36, 0xb5, 0xfa, 0x7c, 0x77, 0xe3, 0xac, 0xc7, 0x1b, 0x9b, 0xab, 0x38, 0xb1, 0xcc, 0xa2,
++	0xc0, 0xc2, 0x1b, 0x89, 0xb6, 0x6c, 0x34, 0xf5, 0x1a, 0x05, 0x1c, 0x6d, 0x6c, 0xc3, 0x46, 0xe3,
++	0x1a, 0x12, 0x5a, 0xa0, 0x01, 0x0a, 0x85, 0x12, 0x67, 0x65, 0xc6, 0x14, 0x87, 0x21, 0x47, 0x89,
++	0xd5, 0x22, 0x40, 0xd1, 0x02, 0xfd, 0x01, 0xed, 0xa5, 0xa7, 0xfe, 0x85, 0x1e, 0x7a, 0xda, 0x3d,
++	0xf5, 0x07, 0xf4, 0x54, 0x17, 0xbd, 0x15, 0xed, 0xa1, 0x97, 0xfe, 0x8a, 0x16, 0xf3, 0x29, 0x92,
++	0xa2, 0xb4, 0x5a, 0xad, 0xd1, 0x83, 0x2f, 0x02, 0xc9, 0x79, 0xbf, 0xe7, 0x79, 0x1f, 0xbe, 0x1c,
++	0xc1, 0x83, 0x91, 0x47, 0x5f, 0x4c, 0x06, 0xad, 0x21, 0x19, 0xdb, 0x5e, 0x70, 0x44, 0x06, 0x3e,
++	0x79, 0x45, 0x42, 0x1c, 0xd8, 0x0e, 0xf5, 0x9d, 0xb8, 0x39, 0x24, 0x01, 0x75, 0x86, 0x34, 0x6e,
++	0x3a, 0x61, 0x68, 0x87, 0x2f, 0x47, 0x76, 0x38, 0xb0, 0xd5, 0xb3, 0x56, 0x18, 0x11, 0x4a, 0xd0,
++	0x96, 0x13, 0x7a, 0x2d, 0xf5, 0xac, 0xfe, 0xfe, 0x88, 0x90, 0x91, 0x8f, 0x6d, 0xbe, 0x36, 0x98,
++	0x1c, 0xd9, 0x78, 0x1c, 0xd2, 0xa9, 0x10, 0xad, 0x5f, 0x93, 0x8b, 0x4e, 0xe8, 0xd9, 0x4e, 0x10,
++	0x10, 0xea, 0x50, 0x8f, 0x04, 0xd2, 0x50, 0xfd, 0x7e, 0x22, 0x14, 0x7f, 0x7a, 0x44, 0x85, 0x8d,
++	0x61, 0x73, 0x84, 0x83, 0xe6, 0xd7, 0x8e, 0xef, 0xb9, 0x0e, 0xc5, 0xf6, 0xdc, 0x85, 0x54, 0xfe,
++	0x28, 0x21, 0x1c, 0x7f, 0xe3, 0x8c, 0x46, 0x38, 0xb2, 0x49, 0xc8, 0xcd, 0xe7, 0xb8, 0x3a, 0x58,
++	0x94, 0x75, 0xc2, 0xca, 0x88, 0x44, 0x63, 0x6d, 0x82, 0xdd, 0x48, 0xdd, 0x7b, 0xab, 0xea, 0xd2,
++	0x69, 0x88, 0x63, 0xf1, 0x2b, 0x55, 0x9f, 0x2e, 0x2f, 0xb6, 0x13, 0x86, 0x4d, 0x4a, 0x88, 0xff,
++	0xd2, 0xa3, 0xf6, 0x57, 0x13, 0x1c, 0x4d, 0xed, 0x21, 0xf1, 0x7d, 0x3c, 0x64, 0x21, 0xf4, 0x49,
++	0x88, 0x23, 0x87, 0x92, 0x48, 0xd9, 0x7a, 0xb8, 0xba, 0xad, 0x28, 0x1c, 0xda, 0x11, 0x8e, 0xc9,
++	0x24, 0x1a, 0x62, 0x7d, 0x21, 0xcc, 0x58, 0x7f, 0x37, 0xa0, 0xf2, 0x3c, 0x22, 0x47, 0x9e, 0x8f,
++	0xd1, 0xc7, 0x50, 0xf0, 0x5c, 0xd3, 0x68, 0x18, 0x7b, 0x9b, 0xed, 0xf7, 0x5a, 0xdc, 0x4e, 0x2b,
++	0x0a, 0x87, 0xad, 0x27, 0x2e, 0x0e, 0xa8, 0x77, 0xe4, 0xe1, 0xa8, 0xb3, 0x7d, 0x72, 0xbc, 0xbb,
++	0x05, 0x80, 0xca, 0x31, 0x8e, 0x3c, 0xc7, 0xdf, 0x33, 0xba, 0x05, 0xcf, 0x45, 0x08, 0x8a, 0x81,
++	0x33, 0xc6, 0x66, 0xa1, 0x61, 0xec, 0xd5, 0xba, 0xfc, 0x1a, 0xed, 0x40, 0x29, 0x20, 0x14, 0xc7,
++	0xe6, 0x06, 0x7f, 0x28, 0x6e, 0xd0, 0x6d, 0xa8, 0x2a, 0xa8, 0x98, 0xc5, 0xc6, 0x86, 0x70, 0x94,
++	0xc0, 0x4f, 0xeb, 0x50, 0x5c, 0x74, 0xb5, 0x18, 0xda, 0x87, 0xf2, 0x28, 0x22, 0x93, 0x30, 0x36,
++	0x4b, 0x5c, 0xe1, 0x72, 0x5a, 0xe1, 0x31, 0x5b, 0xeb, 0x4a, 0x91, 0x83, 0xea, 0xc9, 0xf1, 0x6e,
++	0xb1, 0x6a, 0x34, 0x0c, 0xeb, 0x31, 0xec, 0x1c, 0x46, 0xd8, 0xa1, 0x58, 0x66, 0xd7, 0xc5, 0x5f,
++	0x4d, 0x70, 0x4c, 0x91, 0x0d, 0x95, 0xd0, 0x99, 0xfa, 0xc4, 0x49, 0x64, 0x9a, 0xb4, 0xa7, 0xc4,
++	0x95, 0x94, 0xf5, 0x08, 0xde, 0xcb, 0x18, 0x8a, 0x43, 0x12, 0xc4, 0x18, 0x35, 0xa1, 0x1c, 0xe1,
++	0x78, 0xe2, 0xd3, 0xe5, 0x86, 0xa4, 0x90, 0x75, 0x1f, 0x50, 0x17, 0x3b, 0x6e, 0x26, 0x9c, 0xef,
++	0x9e, 0x5a, 0x73, 0x56, 0x61, 0xeb, 0x53, 0xb8, 0x9c, 0x52, 0x5e, 0x2f, 0x84, 0xc7, 0xb0, 0xf3,
++	0xe3, 0xd0, 0x7d, 0x33, 0x35, 0xc9, 0x18, 0x5a, 0x2f, 0xa0, 0x1f, 0xc0, 0xce, 0xa7, 0xd8, 0xc7,
++	0x73, 0x01, 0xad, 0x58, 0x95, 0x7f, 0x1a, 0x80, 0x7e, 0xe8, 0xc5, 0x74, 0x2e, 0x9d, 0xf2, 0x91,
++	0xe7, 0x53, 0x1c, 0x49, 0x0b, 0x57, 0x5b, 0xaa, 0x41, 0x78, 0x34, 0x8f, 0xf8, 0x9a, 0x17, 0x8c,
++	0xba, 0x52, 0x0c, 0xdd, 0x82, 0x2a, 0x89, 0x5c, 0x1c, 0xf5, 0x07, 0x53, 0x8e, 0x61, 0xe6, 0x34,
++	0xa5, 0xd2, 0x23, 0x11, 0x65, 0x0a, 0x15, 0x2e, 0xd6, 0x99, 0xa2, 0xbb, 0xcc, 0x05, 0xf6, 0x5d,
++	0x01, 0xef, 0xcd, 0xf6, 0xb5, 0xac, 0x0b, 0xec, 0xbb, 0x3d, 0x2c, 0x7b, 0xb7, 0x2b, 0x65, 0xd1,
++	0x2d, 0x28, 0x87, 0xce, 0xc8, 0x0b, 0x46, 0x66, 0x91, 0x6b, 0x99, 0x69, 0xad, 0xe7, 0x6c, 0xcd,
++	0x11, 0x1a, 0x42, 0x8e, 0xed, 0x58, 0x22, 0xc1, 0x58, 0xd7, 0xd9, 0x86, 0x8a, 0x28, 0x61, 0x6c,
++	0x1a, 0x79, 0x6d, 0xa4, 0x77, 0x4c, 0x4a, 0x59, 0x7f, 0x28, 0x40, 0x89, 0xb7, 0xca, 0xff, 0xa3,
++	0xcb, 0x3f, 0x86, 0x4a, 0x28, 0x02, 0x90, 0x89, 0xe6, 0x47, 0xd7, 0x29, 0x9f, 0x1c, 0xef, 0x16,
++	0xac, 0x0b, 0x5d, 0x25, 0x8d, 0xee, 0x02, 0xc8, 0xcb, 0xbe, 0xe7, 0x9a, 0xa5, 0x65, 0xfb, 0x5f,
++	0x93, 0x82, 0x4f, 0x5c, 0x74, 0x2f, 0x41, 0x2a, 0xe5, 0x25, 0xa4, 0x22, 0xfc, 0xb5, 0x2f, 0xcc,
++	0xc8, 0x25, 0xc1, 0x17, 0x87, 0x80, 0x44, 0x9b, 0x0b, 0x42, 0x91, 0x50, 0x6a, 0x66, 0x3b, 0x23,
++	0x97, 0x7d, 0x74, 0x5f, 0x74, 0xe0, 0x72, 0xca, 0x88, 0xdc, 0xad, 0xfd, 0x4c, 0x57, 0xe4, 0x53,
++	0x98, 0xec, 0x89, 0x7b, 0xb0, 0xcd, 0x5a, 0x3d, 0x15, 0xc6, 0x8a, 0xfd, 0xf0, 0x00, 0x2e, 0x25,
++	0x54, 0xd7, 0x71, 0x7e, 0x08, 0x48, 0x34, 0xf6, 0x39, 0xab, 0x90, 0x32, 0xb2, 0x4e, 0x20, 0xf7,
++	0x01, 0x09, 0x66, 0x58, 0xa7, 0x0e, 0xff, 0x30, 0x60, 0x9b, 0xb5, 0x4d, 0x4a, 0xf7, 0x2d, 0x62,
++	0x85, 0x43, 0x41, 0x7b, 0x3c, 0xbd, 0x38, 0xc1, 0xbd, 0x19, 0x4e, 0xc8, 0xdf, 0x25, 0xc5, 0x08,
++	0xff, 0x2d, 0x42, 0x45, 0x36, 0xc6, 0xfa, 0x9c, 0xf0, 0x01, 0xc0, 0x91, 0x17, 0xc5, 0xb4, 0x9f,
++	0x60, 0x86, 0x1a, 0x7f, 0xf2, 0x8c, 0xd1, 0xc3, 0x75, 0xd8, 0x1c, 0x7b, 0xae, 0xeb, 0x63, 0xb1,
++	0x2e, 0x48, 0x02, 0xc4, 0x23, 0x2e, 0xf0, 0x3e, 0xd4, 0x7c, 0x47, 0xa9, 0x17, 0xf9, 0x72, 0x95,
++	0x3d, 0xe0, 0x8b, 0x77, 0xe1, 0x9d, 0x30, 0xf2, 0xc6, 0x4e, 0x34, 0xed, 0xe3, 0xb1, 0xe3, 0xf9,
++	0x66, 0x99, 0x09, 0x74, 0xde, 0x65, 0x5d, 0xbc, 0x6d, 0x9c, 0xfc, 0xe7, 0xcf, 0x1b, 0xc5, 0xa8,
++	0xf0, 0x85, 0xd1, 0xdd, 0x92, 0x52, 0x0f, 0x99, 0xd0, 0x8c, 0x92, 0x2a, 0x49, 0x4a, 0xda, 0x87,
++	0x32, 0xb7, 0x11, 0x9b, 0xd5, 0xbc, 0xda, 0x70, 0xd5, 0xae, 0x14, 0x41, 0xdf, 0x87, 0xad, 0x17,
++	0x64, 0x8c, 0xfb, 0x8e, 0xeb, 0x46, 0x38, 0x8e, 0xcd, 0x5a, 0x1e, 0x89, 0x7d, 0x22, 0x16, 0xbb,
++	0x9b, 0x4c, 0x54, 0xde, 0x30, 0xcd, 0x6f, 0x48, 0xf4, 0x52, 0x6b, 0xc2, 0x52, 0x4d, 0x26, 0xaa,
++	0x34, 0xd3, 0xd4, 0xb7, 0xb9, 0x22, 0xf5, 0x25, 0x98, 0x76, 0xeb, 0x4c, 0x4c, 0x7b, 0xa8, 0xa7,
++	0xaa, 0x77, 0x16, 0x62, 0xa5, 0x73, 0xe5, 0xe4, 0x78, 0x17, 0xb5, 0xb7, 0xe1, 0x22, 0x17, 0xed,
++	0xab, 0x55, 0x35, 0x6d, 0xa1, 0x3b, 0x50, 0x0b, 0xbc, 0xe1, 0x4b, 0xb6, 0x79, 0xb1, 0x79, 0x51,
++	0xfa, 0xe7, 0xa3, 0xb2, 0x98, 0x7a, 0x9f, 0xf6, 0x7e, 0xf4, 0xec, 0x27, 0x8e, 0x3f, 0xc1, 0xdd,
++	0x99, 0x5c, 0x82, 0x72, 0x07, 0x50, 0x12, 0x5b, 0x76, 0x51, 0xc3, 0xaf, 0xc8, 0x51, 0xb5, 0x0f,
++	0x15, 0x55, 0x40, 0x0e, 0xa9, 0xce, 0x25, 0xa6, 0x03, 0x85, 0x5b, 0x89, 0x4d, 0x57, 0x12, 0x07,
++	0xd7, 0x4e, 0x8e, 0x77, 0xcd, 0xaa, 0xc1, 0x5e, 0x4f, 0x03, 0x42, 0x7c, 0x04, 0x5e, 0xdc, 0x97,
++	0x80, 0x68, 0x18, 0xd6, 0xaf, 0x0d, 0xa8, 0xa8, 0x12, 0x9b, 0x33, 0xb3, 0x06, 0xc7, 0x86, 0xba,
++	0x65, 0xba, 0x43, 0x8f, 0x4e, 0xd5, 0xab, 0x8d, 0x5d, 0x33, 0x1c, 0xc5, 0xd4, 0xa1, 0x0a, 0xb5,
++	0xe2, 0x06, 0x6d, 0xc3, 0xc6, 0xcf, 0xbd, 0x50, 0x42, 0x95, 0x5d, 0x32, 0xab, 0x43, 0x32, 0x09,
++	0x68, 0x34, 0xe5, 0x2f, 0xac, 0x5a, 0x57, 0xdd, 0xe6, 0x0d, 0xa3, 0x6a, 0xbc, 0x5d, 0x71, 0xf0,
++	0x52, 0xe2, 0xf3, 0xc3, 0xa8, 0x36, 0xb4, 0xda, 0xe0, 0xa5, 0xc4, 0x33, 0xc3, 0x68, 0x26, 0x9c,
++	0xb3, 0x0d, 0xa3, 0xe7, 0x0c, 0x41, 0x0f, 0xa3, 0x6f, 0xa0, 0x26, 0x19, 0x43, 0xeb, 0x05, 0xa4,
++	0x87, 0xd1, 0xf5, 0xaa, 0x22, 0x47, 0xb5, 0x43, 0xd5, 0x24, 0xab, 0x8e, 0x6a, 0x3a, 0x1f, 0x45,
++	0xcc, 0xdf, 0x03, 0xe8, 0x7d, 0xd6, 0x53, 0xde, 0xb3, 0xbd, 0x61, 0x42, 0x65, 0x8c, 0xe3, 0xd8,
++	0x19, 0x29, 0xba, 0x55, 0xb7, 0x7a, 0x1a, 0x9e, 0xab, 0xe7, 0x5b, 0xf3, 0xde, 0xfb, 0x9b, 0x01,
++	0x95, 0x67, 0x98, 0x32, 0xda, 0x3c, 0xcf, 0x2b, 0xab, 0xc8, 0xda, 0x5e, 0x32, 0x4b, 0x4d, 0x32,
++	0xca, 0x2b, 0xa3, 0xcb, 0x1f, 0xa3, 0xeb, 0x8c, 0x0a, 0xdc, 0x88, 0x67, 0x52, 0xea, 0x6c, 0xb2,
++	0xe5, 0x72, 0xbd, 0x68, 0x36, 0xf6, 0x2e, 0x74, 0xf9, 0x02, 0xfa, 0x08, 0x4a, 0x47, 0xde, 0x2b,
++	0xec, 0xca, 0xef, 0xd7, 0x2b, 0xe9, 0xdd, 0xec, 0x51, 0x87, 0x7a, 0xc3, 0x27, 0xcf, 0xbb, 0x42,
++	0x48, 0xb0, 0xc3, 0x78, 0x8c, 0x03, 0x3a, 0x63, 0x07, 0x7e, 0x9b, 0x60, 0x87, 0x3b, 0x50, 0x55,
++	0x6a, 0x3a, 0x3a, 0x23, 0x37, 0xba, 0x3c, 0x4a, 0x91, 0x05, 0x59, 0xb5, 0x7d, 0x94, 0xf8, 0x3c,
++	0xa5, 0x68, 0x43, 0xab, 0xb5, 0x8f, 0x12, 0xcf, 0x50, 0x4a, 0x26, 0x9c, 0xb3, 0x51, 0xca, 0x39,
++	0x43, 0xd0, 0x94, 0xf2, 0x06, 0x6a, 0x92, 0x31, 0xb4, 0x5e, 0x40, 0x9a, 0x52, 0xd6, 0xab, 0x8a,
++	0xa4, 0x14, 0xa9, 0xbc, 0x3a, 0xa5, 0xe8, 0x7c, 0x14, 0xa5, 0xfc, 0xcb, 0x80, 0xcb, 0x69, 0x4b,
++	0x6f, 0x1d, 0x37, 0x34, 0xe1, 0x12, 0xcb, 0xf0, 0x11, 0xeb, 0x3a, 0x5d, 0x28, 0x33, 0x5d, 0xa8,
++	0xda, 0xac, 0x22, 0xf7, 0xc4, 0x17, 0x82, 0x14, 0x3f, 0xcb, 0xae, 0xb4, 0x5f, 0x17, 0xa1, 0xaa,
++	0x3e, 0xc8, 0xd1, 0x18, 0xca, 0xa2, 0x7b, 0x90, 0x95, 0xa1, 0xf5, 0x9c, 0xc3, 0xa7, 0xfa, 0x77,
++	0x96, 0xca, 0x88, 0xa0, 0xad, 0xfa, 0xaf, 0x5e, 0xff, 0xfb, 0x77, 0x85, 0x1d, 0xab, 0x66, 0xcb,
++	0x61, 0x2d, 0x3e, 0x50, 0xc0, 0x44, 0x04, 0x8a, 0xac, 0x4f, 0x50, 0x23, 0x6d, 0x68, 0xfe, 0x60,
++	0xa9, 0x7e, 0x63, 0x89, 0x84, 0x74, 0x64, 0x71, 0x47, 0xd7, 0x50, 0x5d, 0x3b, 0xb2, 0x7f, 0xe1,
++	0xb9, 0x2d, 0x75, 0x42, 0xd8, 0xf7, 0xdc, 0x6f, 0xd1, 0x6f, 0x0c, 0x28, 0x8b, 0x56, 0xc8, 0x26,
++	0x98, 0x77, 0x92, 0x94, 0x4d, 0x30, 0xf7, 0x90, 0xc8, 0xba, 0xc3, 0xfd, 0x36, 0xeb, 0x56, 0xc2,
++	0xaf, 0x4c, 0xb0, 0x95, 0xf1, 0x3f, 0xcb, 0x7c, 0x02, 0x65, 0xd1, 0x4a, 0xd9, 0x38, 0xf2, 0x0e,
++	0x90, 0xea, 0x57, 0x5a, 0xe2, 0xa8, 0xb9, 0xa5, 0xce, 0xa1, 0x5b, 0x0f, 0xc7, 0x21, 0x9d, 0x5a,
++	0xf6, 0xc9, 0xf1, 0x6e, 0x4d, 0x9f, 0x78, 0x8a, 0xfc, 0x6f, 0x2e, 0xcb, 0xbf, 0x0f, 0x45, 0x86,
++	0x93, 0x6c, 0xc1, 0xe7, 0x4f, 0x9d, 0xea, 0xd6, 0x42, 0x09, 0xdd, 0xb8, 0xd6, 0x25, 0xee, 0x71,
++	0x13, 0xcd, 0xb6, 0xb6, 0xce, 0x27, 0xf3, 0xaa, 0xd1, 0xfe, 0x53, 0x11, 0xca, 0xe2, 0x83, 0x0e,
++	0x8d, 0x34, 0xa6, 0x1a, 0x79, 0x78, 0x49, 0x7e, 0xd5, 0x66, 0xb7, 0x39, 0xe7, 0xf4, 0xc1, 0x32,
++	0xb9, 0x53, 0x64, 0x55, 0x6c, 0x79, 0x48, 0xaa, 0x6b, 0xea, 0x49, 0x34, 0x7d, 0x38, 0x8f, 0x95,
++	0x94, 0x93, 0xeb, 0x0b, 0xd7, 0xa5, 0x8b, 0x06, 0x77, 0x51, 0x47, 0xa6, 0x74, 0x31, 0x5f, 0xc7,
++	0x5f, 0xce, 0x70, 0xd4, 0xc8, 0xc3, 0xc8, 0xb2, 0xa4, 0x72, 0x0e, 0x13, 0xac, 0xdb, 0xdc, 0xe3,
++	0x7e, 0xbd, 0xa1, 0x3d, 0x9e, 0x8a, 0x20, 0xa2, 0x11, 0xd4, 0xc8, 0x43, 0x50, 0x2a, 0x82, 0x45,
++	0xf8, 0xd9, 0x3f, 0x39, 0xde, 0xad, 0xc8, 0x93, 0x34, 0x91, 0xf3, 0xcd, 0xc5, 0x39, 0xff, 0x54,
++	0x62, 0xe7, 0xc3, 0x79, 0x64, 0xa4, 0x9c, 0x35, 0x16, 0xac, 0xcf, 0x70, 0xf3, 0x2e, 0xf7, 0x55,
++	0x43, 0x6a, 0x0b, 0x35, 0x6a, 0xfe, 0x58, 0x82, 0xaa, 0x9a, 0x38, 0x4f, 0xe3, 0xa2, 0xf4, 0x5c,
++	0x98, 0xcf, 0x45, 0x99, 0x11, 0x3a, 0xc1, 0x45, 0xfa, 0xc8, 0x6c, 0x15, 0x2e, 0xca, 0xb8, 0xba,
++	0xb1, 0x44, 0x62, 0x8e, 0x8b, 0x94, 0xd8, 0xd9, 0xb9, 0x68, 0x79, 0x82, 0xb9, 0xdf, 0x08, 0x09,
++	0x2e, 0x9a, 0xf9, 0x3d, 0x2f, 0x17, 0x65, 0xe2, 0x38, 0x85, 0x8b, 0xa4, 0xb4, 0xe6, 0xa2, 0xc5,
++	0xf9, 0x2f, 0xe1, 0xa2, 0x8c, 0x4b, 0x6b, 0xa1, 0x44, 0x1e, 0x17, 0xe9, 0xbf, 0x5a, 0x3e, 0x87,
++	0x4a, 0x0f, 0x07, 0x6e, 0xef, 0xb3, 0x1e, 0x32, 0x33, 0x63, 0xad, 0xfe, 0x20, 0x59, 0x98, 0xce,
++	0x07, 0xdc, 0xde, 0x55, 0x0b, 0xa5, 0x32, 0xf8, 0xd6, 0x8e, 0xc7, 0xf1, 0x81, 0x71, 0x53, 0x23,
++	0xf6, 0x2f, 0x25, 0xa8, 0xaa, 0x31, 0xe4, 0x34, 0xc4, 0xa6, 0xa7, 0xa6, 0x7c, 0xc4, 0x66, 0x26,
++	0xb4, 0x04, 0x62, 0x03, 0xe9, 0x65, 0x25, 0xc4, 0x66, 0x5c, 0xdd, 0x58, 0x22, 0x31, 0x87, 0x58,
++	0xe5, 0xe8, 0xec, 0x88, 0x5d, 0x9e, 0x60, 0xee, 0x08, 0x9a, 0x40, 0xec, 0xcc, 0xef, 0x79, 0x11,
++	0x9b, 0x89, 0xe3, 0x14, 0xc4, 0x4a, 0x69, 0x8d, 0xd8, 0xc5, 0xf9, 0x7f, 0x0d, 0x35, 0x3d, 0x65,
++	0xe5, 0xd1, 0x60, 0x72, 0xfc, 0xca, 0xbe, 0x65, 0xe6, 0xa6, 0x39, 0x6b, 0x8f, 0x7b, 0xb4, 0x50,
++	0x63, 0xb1, 0x47, 0x5b, 0x7c, 0x75, 0x7d, 0x21, 0x3b, 0xe5, 0xc6, 0xbc, 0xc9, 0xcc, 0x08, 0x9c,
++	0xd7, 0x2a, 0xd9, 0x79, 0x3b, 0xd1, 0x2a, 0xca, 0xb1, 0x82, 0x73, 0xe7, 0xaf, 0xc6, 0x6f, 0x3f,
++	0xf9, 0xbd, 0x81, 0x82, 0x19, 0x0d, 0x5b, 0x3f, 0x83, 0x8b, 0x4f, 0xc9, 0x8b, 0xa0, 0xd1, 0xc1,
++	0xbe, 0x33, 0x76, 0x22, 0x6f, 0x88, 0xda, 0x2f, 0x28, 0x0d, 0xe3, 0x03, 0xdb, 0x5e, 0xfd, 0xcf,
++	0xf6, 0xfa, 0xd5, 0x2f, 0x07, 0x4a, 0xff, 0x81, 0x9e, 0x7d, 0x87, 0x64, 0xdc, 0xde, 0xb8, 0xdd,
++	0xba, 0x75, 0xb3, 0x60, 0x14, 0xda, 0xdb, 0x4e, 0x18, 0xfa, 0xde, 0x90, 0x8f, 0xc1, 0xf6, 0x97,
++	0x31, 0x09, 0x0e, 0xe6, 0x9e, 0x7c, 0x7e, 0xf7, 0xcc, 0x7f, 0xef, 0xdf, 0x0f, 0x07, 0x83, 0x32,
++	0xdf, 0xf7, 0x3b, 0xff, 0x0b, 0x00, 0x00, 0xff, 0xff, 0x20, 0xb0, 0xfd, 0x68, 0x1d, 0x20, 0x00,
+ 	0x00,
+ }
+diff --git a/pkg/pb/contacts.pb.gorm.go b/pkg/pb/contacts.pb.gorm.go
+index f00e1af..b9c9e45 100644
+--- a/pkg/pb/contacts.pb.gorm.go
++++ b/pkg/pb/contacts.pb.gorm.go
+@@ -41,6 +41,19 @@ It has these top-level messages:
+ 	ListContactsResponse
+ 	SMSRequest
+ 	ListContactRequest
++	Network
++	StaticIP
++	CreateNetworkRequest
++	CreateNetworkResponse
++	ReadNetworkRequest
++	ReadNetworkResponse
++	UpdateNetworkRequest
++	UpdateNetworkResponse
++	DeleteNetworkRequest
++	ListNetworksResponse
++	ListNetworksRequest
++	ListFixedResponse
++	ListFixedRequest
+ */
+ package pb
+ 
+@@ -203,7 +216,7 @@ type ProfileWithAfterToPB interface {
+ 
+ type GroupORM struct {
+ 	AccountID string
+-	Contacts  []*ContactORM `gorm:"many2many:group_contacts;foreignkey:Id;association_foreignkey:Id;jointable_foreignkey:group_id;association_jointable_foreignkey:contact_id"`
++	Contacts  []*ContactORM `gorm:"foreignkey:Id;association_foreignkey:Id;many2many:group_contacts;jointable_foreignkey:group_id;association_jointable_foreignkey:contact_id"`
+ 	Id        int64         `gorm:"type:serial;primary_key"`
+ 	Name      string
+ 	Notes     string
+@@ -348,7 +361,7 @@ type ContactORM struct {
+ 	AccountID   string
+ 	Emails      []*EmailORM `gorm:"foreignkey:ContactId;association_foreignkey:Id"`
+ 	FirstName   string
+-	Groups      []*GroupORM `gorm:"many2many:group_contacts;foreignkey:Id;association_foreignkey:Id;jointable_foreignkey:contact_id;association_jointable_foreignkey:group_id"`
++	Groups      []*GroupORM `gorm:"foreignkey:Id;association_foreignkey:Id;many2many:group_contacts;jointable_foreignkey:contact_id;association_jointable_foreignkey:group_id"`
+ 	HomeAddress *AddressORM `gorm:"foreignkey:HomeAddressContactId;association_foreignkey:Id"`
+ 	Id          int64       `gorm:"type:serial;primary_key"`
+ 	LastName    string
+@@ -716,6 +729,191 @@ type AddressWithAfterToPB interface {
+ 	AfterToPB(context.Context, *Address) error
+ }
+ 
++type NetworkORM struct {
++	AccountID string
++	Addr      string
++	Cidr      int32
++	Comment   string
++	Fixed     []*StaticIPORM `gorm:"foreignkey:NetworkId;association_foreignkey:Id"`
++	Id        int64          `gorm:"type:serial;primary_key"`
++}
++
++// TableName overrides the default tablename generated by GORM
++func (NetworkORM) TableName() string {
++	return "networks"
++}
++
++// ToORM runs the BeforeToORM hook if present, converts the fields of this
++// object to ORM format, runs the AfterToORM hook, then returns the ORM object
++func (m *Network) ToORM(ctx context.Context) (NetworkORM, error) {
++	to := NetworkORM{}
++	var err error
++	if prehook, ok := interface{}(m).(NetworkWithBeforeToORM); ok {
++		if err = prehook.BeforeToORM(ctx, &to); err != nil {
++			return to, err
++		}
++	}
++	if v, err := resource1.DecodeInt64(&Network{}, m.Id); err != nil {
++		return to, err
++	} else {
++		to.Id = v
++	}
++	to.Addr = m.Addr
++	to.Cidr = m.Cidr
++	for _, v := range m.Fixed {
++		if v != nil {
++			if tempFixed, cErr := v.ToORM(ctx); cErr == nil {
++				to.Fixed = append(to.Fixed, &tempFixed)
++			} else {
++				return to, cErr
++			}
++		} else {
++			to.Fixed = append(to.Fixed, nil)
++		}
++	}
++	to.Comment = m.Comment
++	accountID, err := auth1.GetAccountID(ctx, nil)
++	if err != nil {
++		return to, err
++	}
++	to.AccountID = accountID
++	if posthook, ok := interface{}(m).(NetworkWithAfterToORM); ok {
++		err = posthook.AfterToORM(ctx, &to)
++	}
++	return to, err
++}
++
++// ToPB runs the BeforeToPB hook if present, converts the fields of this
++// object to PB format, runs the AfterToPB hook, then returns the PB object
++func (m *NetworkORM) ToPB(ctx context.Context) (Network, error) {
++	to := Network{}
++	var err error
++	if prehook, ok := interface{}(m).(NetworkWithBeforeToPB); ok {
++		if err = prehook.BeforeToPB(ctx, &to); err != nil {
++			return to, err
++		}
++	}
++	if v, err := resource1.Encode(&Network{}, m.Id); err != nil {
++		return to, err
++	} else {
++		to.Id = v
++	}
++	to.Addr = m.Addr
++	to.Cidr = m.Cidr
++	for _, v := range m.Fixed {
++		if v != nil {
++			if tempFixed, cErr := v.ToPB(ctx); cErr == nil {
++				to.Fixed = append(to.Fixed, &tempFixed)
++			} else {
++				return to, cErr
++			}
++		} else {
++			to.Fixed = append(to.Fixed, nil)
++		}
++	}
++	to.Comment = m.Comment
++	if posthook, ok := interface{}(m).(NetworkWithAfterToPB); ok {
++		err = posthook.AfterToPB(ctx, &to)
++	}
++	return to, err
++}
++
++// The following are interfaces you can implement for special behavior during ORM/PB conversions
++// of type Network the arg will be the target, the caller the one being converted from
++
++// NetworkBeforeToORM called before default ToORM code
++type NetworkWithBeforeToORM interface {
++	BeforeToORM(context.Context, *NetworkORM) error
++}
++
++// NetworkAfterToORM called after default ToORM code
++type NetworkWithAfterToORM interface {
++	AfterToORM(context.Context, *NetworkORM) error
++}
++
++// NetworkBeforeToPB called before default ToPB code
++type NetworkWithBeforeToPB interface {
++	BeforeToPB(context.Context, *Network) error
++}
++
++// NetworkAfterToPB called after default ToPB code
++type NetworkWithAfterToPB interface {
++	AfterToPB(context.Context, *Network) error
++}
++
++type StaticIPORM struct {
++	AccountID string
++	Addr      string
++	NetworkId *int64
++}
++
++// TableName overrides the default tablename generated by GORM
++func (StaticIPORM) TableName() string {
++	return "static_ips"
++}
++
++// ToORM runs the BeforeToORM hook if present, converts the fields of this
++// object to ORM format, runs the AfterToORM hook, then returns the ORM object
++func (m *StaticIP) ToORM(ctx context.Context) (StaticIPORM, error) {
++	to := StaticIPORM{}
++	var err error
++	if prehook, ok := interface{}(m).(StaticIPWithBeforeToORM); ok {
++		if err = prehook.BeforeToORM(ctx, &to); err != nil {
++			return to, err
++		}
++	}
++	to.Addr = m.Addr
++	accountID, err := auth1.GetAccountID(ctx, nil)
++	if err != nil {
++		return to, err
++	}
++	to.AccountID = accountID
++	if posthook, ok := interface{}(m).(StaticIPWithAfterToORM); ok {
++		err = posthook.AfterToORM(ctx, &to)
++	}
++	return to, err
++}
++
++// ToPB runs the BeforeToPB hook if present, converts the fields of this
++// object to PB format, runs the AfterToPB hook, then returns the PB object
++func (m *StaticIPORM) ToPB(ctx context.Context) (StaticIP, error) {
++	to := StaticIP{}
++	var err error
++	if prehook, ok := interface{}(m).(StaticIPWithBeforeToPB); ok {
++		if err = prehook.BeforeToPB(ctx, &to); err != nil {
++			return to, err
++		}
++	}
++	to.Addr = m.Addr
++	if posthook, ok := interface{}(m).(StaticIPWithAfterToPB); ok {
++		err = posthook.AfterToPB(ctx, &to)
++	}
++	return to, err
++}
++
++// The following are interfaces you can implement for special behavior during ORM/PB conversions
++// of type StaticIP the arg will be the target, the caller the one being converted from
++
++// StaticIPBeforeToORM called before default ToORM code
++type StaticIPWithBeforeToORM interface {
++	BeforeToORM(context.Context, *StaticIPORM) error
++}
++
++// StaticIPAfterToORM called after default ToORM code
++type StaticIPWithAfterToORM interface {
++	AfterToORM(context.Context, *StaticIPORM) error
++}
++
++// StaticIPBeforeToPB called before default ToPB code
++type StaticIPWithBeforeToPB interface {
++	BeforeToPB(context.Context, *StaticIP) error
++}
++
++// StaticIPAfterToPB called after default ToPB code
++type StaticIPWithAfterToPB interface {
++	AfterToPB(context.Context, *StaticIP) error
++}
++
+ // DefaultCreateProfile executes a basic gorm create call
+ func DefaultCreateProfile(ctx context.Context, in *Profile, db *gorm1.DB) (*Profile, error) {
+ 	if in == nil {
+@@ -1378,6 +1576,198 @@ func DefaultListAddress(ctx context.Context, db *gorm1.DB, req interface{}) ([]*
+ 	return pbResponse, nil
+ }
+ 
++// DefaultCreateNetwork executes a basic gorm create call
++func DefaultCreateNetwork(ctx context.Context, in *Network, db *gorm1.DB) (*Network, error) {
++	if in == nil {
++		return nil, errors.New("Nil argument to DefaultCreateNetwork")
++	}
++	ormObj, err := in.ToORM(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if err = db.Create(&ormObj).Error; err != nil {
++		return nil, err
++	}
++	pbResponse, err := ormObj.ToPB(ctx)
++	return &pbResponse, err
++}
++
++// DefaultReadNetwork executes a basic gorm read call
++func DefaultReadNetwork(ctx context.Context, in *Network, db *gorm1.DB) (*Network, error) {
++	if in == nil {
++		return nil, errors.New("Nil argument to DefaultReadNetwork")
++	}
++	ormParams, err := in.ToORM(ctx)
++	if err != nil {
++		return nil, err
++	}
++	ormResponse := NetworkORM{}
++	if err = db.Where(&ormParams).First(&ormResponse).Error; err != nil {
++		return nil, err
++	}
++	pbResponse, err := ormResponse.ToPB(ctx)
++	return &pbResponse, err
++}
++
++// DefaultUpdateNetwork executes a basic gorm update call
++func DefaultUpdateNetwork(ctx context.Context, in *Network, db *gorm1.DB) (*Network, error) {
++	if in == nil {
++		return nil, errors.New("Nil argument to DefaultUpdateNetwork")
++	}
++	accountID, err := auth1.GetAccountID(ctx, nil)
++	if err != nil {
++		return nil, err
++	}
++	if exists, err := DefaultReadNetwork(ctx, &Network{Id: in.GetId()}, db); err != nil {
++		return nil, err
++	} else if exists == nil {
++		return nil, errors.New("Network not found")
++	}
++	ormObj, err := in.ToORM(ctx)
++	if err != nil {
++		return nil, err
++	}
++	ormObj.AccountID = accountID
++	db = db.Where(&NetworkORM{AccountID: accountID})
++	if err = db.Save(&ormObj).Error; err != nil {
++		return nil, err
++	}
++	pbResponse, err := ormObj.ToPB(ctx)
++	return &pbResponse, err
++}
++
++func DefaultDeleteNetwork(ctx context.Context, in *Network, db *gorm1.DB) error {
++	if in == nil {
++		return errors.New("Nil argument to DefaultDeleteNetwork")
++	}
++	ormObj, err := in.ToORM(ctx)
++	if err != nil {
++		return err
++	}
++	if ormObj.Id == 0 {
++		return errors.New("A non-zero ID value is required for a delete call")
++	}
++	err = db.Where(&ormObj).Delete(&NetworkORM{}).Error
++	return err
++}
++
++// DefaultStrictUpdateNetwork clears first level 1:many children and then executes a gorm update call
++func DefaultStrictUpdateNetwork(ctx context.Context, in *Network, db *gorm1.DB) (*Network, error) {
++	if in == nil {
++		return nil, fmt.Errorf("Nil argument to DefaultCascadedUpdateNetwork")
++	}
++	ormObj, err := in.ToORM(ctx)
++	if err != nil {
++		return nil, err
++	}
++	count := 1
++	err = db.Model(&ormObj).Where("id=?", ormObj.Id).Count(&count).Error
++	if err != nil {
++		return nil, err
++	}
++	filterFixed := StaticIPORM{}
++	if ormObj.Id == 0 {
++		return nil, errors.New("Can't do overwriting update with no Id value for NetworkORM")
++	}
++	filterFixed.NetworkId = new(int64)
++	*filterFixed.NetworkId = ormObj.Id
++	filterFixed.AccountID = ormObj.AccountID
++	if err = db.Where(filterFixed).Delete(StaticIPORM{}).Error; err != nil {
++		return nil, err
++	}
++	db = db.Where(&NetworkORM{AccountID: ormObj.AccountID})
++	if err = db.Save(&ormObj).Error; err != nil {
++		return nil, err
++	}
++	pbResponse, err := ormObj.ToPB(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if count == 0 {
++		err = gateway1.SetCreated(ctx, "")
++	}
++	return &pbResponse, err
++}
++
++// DefaultListNetwork executes a gorm list call
++func DefaultListNetwork(ctx context.Context, db *gorm1.DB, req interface{}) ([]*Network, error) {
++	ormResponse := []NetworkORM{}
++	f, s, p, fs, err := getCollectionOperators(req)
++	if err != nil {
++		return nil, err
++	}
++	db, err = gorm2.ApplyCollectionOperators(db, &NetworkORM{}, f, s, p, fs)
++	if err != nil {
++		return nil, err
++	}
++	in := Network{}
++	ormParams, err := in.ToORM(ctx)
++	if err != nil {
++		return nil, err
++	}
++	db = db.Where(&ormParams)
++	db = db.Order("id")
++	if err := db.Find(&ormResponse).Error; err != nil {
++		return nil, err
++	}
++	pbResponse := []*Network{}
++	for _, responseEntry := range ormResponse {
++		temp, err := responseEntry.ToPB(ctx)
++		if err != nil {
++			return nil, err
++		}
++		pbResponse = append(pbResponse, &temp)
++	}
++	return pbResponse, nil
++}
++
++// DefaultCreateStaticIP executes a basic gorm create call
++func DefaultCreateStaticIP(ctx context.Context, in *StaticIP, db *gorm1.DB) (*StaticIP, error) {
++	if in == nil {
++		return nil, errors.New("Nil argument to DefaultCreateStaticIP")
++	}
++	ormObj, err := in.ToORM(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if err = db.Create(&ormObj).Error; err != nil {
++		return nil, err
++	}
++	pbResponse, err := ormObj.ToPB(ctx)
++	return &pbResponse, err
++}
++
++// DefaultListStaticIP executes a gorm list call
++func DefaultListStaticIP(ctx context.Context, db *gorm1.DB, req interface{}) ([]*StaticIP, error) {
++	ormResponse := []StaticIPORM{}
++	f, s, p, fs, err := getCollectionOperators(req)
++	if err != nil {
++		return nil, err
++	}
++	db, err = gorm2.ApplyCollectionOperators(db, &StaticIPORM{}, f, s, p, fs)
++	if err != nil {
++		return nil, err
++	}
++	in := StaticIP{}
++	ormParams, err := in.ToORM(ctx)
++	if err != nil {
++		return nil, err
++	}
++	db = db.Where(&ormParams)
++	if err := db.Find(&ormResponse).Error; err != nil {
++		return nil, err
++	}
++	pbResponse := []*StaticIP{}
++	for _, responseEntry := range ormResponse {
++		temp, err := responseEntry.ToPB(ctx)
++		if err != nil {
++			return nil, err
++		}
++		pbResponse = append(pbResponse, &temp)
++	}
++	return pbResponse, nil
++}
++
+ type ProfilesDefaultServer struct {
+ 	DB *gorm1.DB
+ }
+@@ -1641,3 +2031,99 @@ func (m *ContactsDefaultServer) SendSMS(ctx context.Context, in *SMSRequest) (*g
+ 	}
+ 	return &google_protobuf.Empty{}, nil
+ }
++
++type NetworksDefaultServer struct {
++	DB *gorm1.DB
++}
++type NetworksCreateCustomHandler interface {
++	CustomCreate(context.Context, *CreateNetworkRequest) (*CreateNetworkResponse, error)
++}
++
++// Create ...
++func (m *NetworksDefaultServer) Create(ctx context.Context, in *CreateNetworkRequest) (*CreateNetworkResponse, error) {
++	if custom, ok := interface{}(m).(NetworksCreateCustomHandler); ok {
++		return custom.CustomCreate(ctx, in)
++	}
++	db := m.DB
++	res, err := DefaultCreateNetwork(ctx, in.GetPayload(), db)
++	if err != nil {
++		return nil, err
++	}
++	return &CreateNetworkResponse{Result: res}, nil
++}
++
++type NetworksReadCustomHandler interface {
++	CustomRead(context.Context, *ReadNetworkRequest) (*ReadNetworkResponse, error)
++}
++
++// Read ...
++func (m *NetworksDefaultServer) Read(ctx context.Context, in *ReadNetworkRequest) (*ReadNetworkResponse, error) {
++	if custom, ok := interface{}(m).(NetworksReadCustomHandler); ok {
++		return custom.CustomRead(ctx, in)
++	}
++	db := m.DB
++	res, err := DefaultReadNetwork(ctx, &Network{Id: in.GetId()}, db)
++	if err != nil {
++		return nil, err
++	}
++	return &ReadNetworkResponse{Result: res}, nil
++}
++
++type NetworksUpdateCustomHandler interface {
++	CustomUpdate(context.Context, *UpdateNetworkRequest) (*UpdateNetworkResponse, error)
++}
++
++// Update ...
++func (m *NetworksDefaultServer) Update(ctx context.Context, in *UpdateNetworkRequest) (*UpdateNetworkResponse, error) {
++	if custom, ok := interface{}(m).(NetworksUpdateCustomHandler); ok {
++		return custom.CustomUpdate(ctx, in)
++	}
++	db := m.DB
++	res, err := DefaultStrictUpdateNetwork(ctx, in.GetPayload(), db)
++	if err != nil {
++		return nil, err
++	}
++	return &UpdateNetworkResponse{Result: res}, nil
++}
++
++type NetworksDeleteCustomHandler interface {
++	CustomDelete(context.Context, *DeleteNetworkRequest) (*google_protobuf.Empty, error)
++}
++
++// Delete ...
++func (m *NetworksDefaultServer) Delete(ctx context.Context, in *DeleteNetworkRequest) (*google_protobuf.Empty, error) {
++	if custom, ok := interface{}(m).(NetworksDeleteCustomHandler); ok {
++		return custom.CustomDelete(ctx, in)
++	}
++	db := m.DB
++	return &google_protobuf.Empty{}, DefaultDeleteNetwork(ctx, &Network{Id: in.GetId()}, db)
++}
++
++type NetworksListFixedCustomHandler interface {
++	CustomListFixed(context.Context, *ListFixedRequest) (*ListFixedResponse, error)
++}
++
++// ListFixed ...
++func (m *NetworksDefaultServer) ListFixed(ctx context.Context, in *ListFixedRequest) (*ListFixedResponse, error) {
++	if custom, ok := interface{}(m).(NetworksListFixedCustomHandler); ok {
++		return custom.CustomListFixed(ctx, in)
++	}
++	return &ListFixedResponse{}, nil
++}
++
++type NetworksListCustomHandler interface {
++	CustomList(context.Context, *ListNetworksRequest) (*ListNetworksResponse, error)
++}
++
++// List ...
++func (m *NetworksDefaultServer) List(ctx context.Context, in *ListNetworksRequest) (*ListNetworksResponse, error) {
++	if custom, ok := interface{}(m).(NetworksListCustomHandler); ok {
++		return custom.CustomList(ctx, in)
++	}
++	db := m.DB
++	res, err := DefaultListNetwork(ctx, db, in)
++	if err != nil {
++		return nil, err
++	}
++	return &ListNetworksResponse{Results: res}, nil
++}
+diff --git a/pkg/pb/contacts.pb.gw.go b/pkg/pb/contacts.pb.gw.go
+index 034a374..ca045ac 100644
+--- a/pkg/pb/contacts.pb.gw.go
++++ b/pkg/pb/contacts.pb.gw.go
+@@ -452,6 +452,172 @@ func request_Contacts_SendSMS_0(ctx context.Context, marshaler runtime.Marshaler
+ 
+ }
+ 
++func request_Networks_Create_0(ctx context.Context, marshaler runtime.Marshaler, client NetworksClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
++	var protoReq CreateNetworkRequest
++	var metadata runtime.ServerMetadata
++
++	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq.Payload); err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
++	}
++
++	msg, err := client.Create(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
++	return msg, metadata, err
++
++}
++
++var (
++	filter_Networks_Read_0 = &utilities.DoubleArray{Encoding: map[string]int{"id": 0, "resource_id": 1}, Base: []int{1, 1, 1, 0}, Check: []int{0, 1, 2, 3}}
++)
++
++func request_Networks_Read_0(ctx context.Context, marshaler runtime.Marshaler, client NetworksClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
++	var protoReq ReadNetworkRequest
++	var metadata runtime.ServerMetadata
++
++	var (
++		val string
++		ok  bool
++		err error
++		_   = err
++	)
++
++	val, ok = pathParams["id.resource_id"]
++	if !ok {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "missing parameter %s", "id.resource_id")
++	}
++
++	err = runtime.PopulateFieldFromPath(&protoReq, "id.resource_id", val)
++
++	if err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "id.resource_id", err)
++	}
++
++	if err := runtime.PopulateQueryParameters(&protoReq, req.URL.Query(), filter_Networks_Read_0); err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
++	}
++
++	msg, err := client.Read(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
++	return msg, metadata, err
++
++}
++
++func request_Networks_Update_0(ctx context.Context, marshaler runtime.Marshaler, client NetworksClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
++	var protoReq UpdateNetworkRequest
++	var metadata runtime.ServerMetadata
++
++	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq.Payload); err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
++	}
++
++	var (
++		val string
++		ok  bool
++		err error
++		_   = err
++	)
++
++	val, ok = pathParams["payload.id.resource_id"]
++	if !ok {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "missing parameter %s", "payload.id.resource_id")
++	}
++
++	err = runtime.PopulateFieldFromPath(&protoReq, "payload.id.resource_id", val)
++
++	if err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "payload.id.resource_id", err)
++	}
++
++	msg, err := client.Update(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
++	return msg, metadata, err
++
++}
++
++var (
++	filter_Networks_Delete_0 = &utilities.DoubleArray{Encoding: map[string]int{"id": 0, "resource_id": 1}, Base: []int{1, 1, 1, 0}, Check: []int{0, 1, 2, 3}}
++)
++
++func request_Networks_Delete_0(ctx context.Context, marshaler runtime.Marshaler, client NetworksClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
++	var protoReq DeleteNetworkRequest
++	var metadata runtime.ServerMetadata
++
++	var (
++		val string
++		ok  bool
++		err error
++		_   = err
++	)
++
++	val, ok = pathParams["id.resource_id"]
++	if !ok {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "missing parameter %s", "id.resource_id")
++	}
++
++	err = runtime.PopulateFieldFromPath(&protoReq, "id.resource_id", val)
++
++	if err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "id.resource_id", err)
++	}
++
++	if err := runtime.PopulateQueryParameters(&protoReq, req.URL.Query(), filter_Networks_Delete_0); err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
++	}
++
++	msg, err := client.Delete(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
++	return msg, metadata, err
++
++}
++
++var (
++	filter_Networks_ListFixed_0 = &utilities.DoubleArray{Encoding: map[string]int{"id": 0, "resource_id": 1}, Base: []int{1, 1, 1, 0}, Check: []int{0, 1, 2, 3}}
++)
++
++func request_Networks_ListFixed_0(ctx context.Context, marshaler runtime.Marshaler, client NetworksClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
++	var protoReq ListFixedRequest
++	var metadata runtime.ServerMetadata
++
++	var (
++		val string
++		ok  bool
++		err error
++		_   = err
++	)
++
++	val, ok = pathParams["id.resource_id"]
++	if !ok {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "missing parameter %s", "id.resource_id")
++	}
++
++	err = runtime.PopulateFieldFromPath(&protoReq, "id.resource_id", val)
++
++	if err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "id.resource_id", err)
++	}
++
++	if err := runtime.PopulateQueryParameters(&protoReq, req.URL.Query(), filter_Networks_ListFixed_0); err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
++	}
++
++	msg, err := client.ListFixed(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
++	return msg, metadata, err
++
++}
++
++var (
++	filter_Networks_List_0 = &utilities.DoubleArray{Encoding: map[string]int{}, Base: []int(nil), Check: []int(nil)}
++)
++
++func request_Networks_List_0(ctx context.Context, marshaler runtime.Marshaler, client NetworksClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
++	var protoReq ListNetworksRequest
++	var metadata runtime.ServerMetadata
++
++	if err := runtime.PopulateQueryParameters(&protoReq, req.URL.Query(), filter_Networks_List_0); err != nil {
++		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
++	}
++
++	msg, err := client.List(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
++	return msg, metadata, err
++
++}
++
+ // RegisterProfilesHandlerFromEndpoint is same as RegisterProfilesHandler but
+ // automatically dials to "endpoint" and closes the connection when "ctx" gets done.
+ func RegisterProfilesHandlerFromEndpoint(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error) {
+@@ -1114,3 +1280,246 @@ var (
+ 
+ 	forward_Contacts_SendSMS_0 = runtime.ForwardResponseMessage
+ )
++
++// RegisterNetworksHandlerFromEndpoint is same as RegisterNetworksHandler but
++// automatically dials to "endpoint" and closes the connection when "ctx" gets done.
++func RegisterNetworksHandlerFromEndpoint(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error) {
++	conn, err := grpc.Dial(endpoint, opts...)
++	if err != nil {
++		return err
++	}
++	defer func() {
++		if err != nil {
++			if cerr := conn.Close(); cerr != nil {
++				grpclog.Printf("Failed to close conn to %s: %v", endpoint, cerr)
++			}
++			return
++		}
++		go func() {
++			<-ctx.Done()
++			if cerr := conn.Close(); cerr != nil {
++				grpclog.Printf("Failed to close conn to %s: %v", endpoint, cerr)
++			}
++		}()
++	}()
++
++	return RegisterNetworksHandler(ctx, mux, conn)
++}
++
++// RegisterNetworksHandler registers the http handlers for service Networks to "mux".
++// The handlers forward requests to the grpc endpoint over "conn".
++func RegisterNetworksHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
++	return RegisterNetworksHandlerClient(ctx, mux, NewNetworksClient(conn))
++}
++
++// RegisterNetworksHandler registers the http handlers for service Networks to "mux".
++// The handlers forward requests to the grpc endpoint over the given implementation of "NetworksClient".
++// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "NetworksClient"
++// doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
++// "NetworksClient" to call the correct interceptors.
++func RegisterNetworksHandlerClient(ctx context.Context, mux *runtime.ServeMux, client NetworksClient) error {
++
++	mux.Handle("POST", pattern_Networks_Create_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
++		ctx, cancel := context.WithCancel(req.Context())
++		defer cancel()
++		if cn, ok := w.(http.CloseNotifier); ok {
++			go func(done <-chan struct{}, closed <-chan bool) {
++				select {
++				case <-done:
++				case <-closed:
++					cancel()
++				}
++			}(ctx.Done(), cn.CloseNotify())
++		}
++		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
++		rctx, err := runtime.AnnotateContext(ctx, mux, req)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++		resp, md, err := request_Networks_Create_0(rctx, inboundMarshaler, client, req, pathParams)
++		ctx = runtime.NewServerMetadataContext(ctx, md)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++
++		forward_Networks_Create_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
++
++	})
++
++	mux.Handle("GET", pattern_Networks_Read_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
++		ctx, cancel := context.WithCancel(req.Context())
++		defer cancel()
++		if cn, ok := w.(http.CloseNotifier); ok {
++			go func(done <-chan struct{}, closed <-chan bool) {
++				select {
++				case <-done:
++				case <-closed:
++					cancel()
++				}
++			}(ctx.Done(), cn.CloseNotify())
++		}
++		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
++		rctx, err := runtime.AnnotateContext(ctx, mux, req)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++		resp, md, err := request_Networks_Read_0(rctx, inboundMarshaler, client, req, pathParams)
++		ctx = runtime.NewServerMetadataContext(ctx, md)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++
++		forward_Networks_Read_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
++
++	})
++
++	mux.Handle("PUT", pattern_Networks_Update_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
++		ctx, cancel := context.WithCancel(req.Context())
++		defer cancel()
++		if cn, ok := w.(http.CloseNotifier); ok {
++			go func(done <-chan struct{}, closed <-chan bool) {
++				select {
++				case <-done:
++				case <-closed:
++					cancel()
++				}
++			}(ctx.Done(), cn.CloseNotify())
++		}
++		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
++		rctx, err := runtime.AnnotateContext(ctx, mux, req)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++		resp, md, err := request_Networks_Update_0(rctx, inboundMarshaler, client, req, pathParams)
++		ctx = runtime.NewServerMetadataContext(ctx, md)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++
++		forward_Networks_Update_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
++
++	})
++
++	mux.Handle("DELETE", pattern_Networks_Delete_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
++		ctx, cancel := context.WithCancel(req.Context())
++		defer cancel()
++		if cn, ok := w.(http.CloseNotifier); ok {
++			go func(done <-chan struct{}, closed <-chan bool) {
++				select {
++				case <-done:
++				case <-closed:
++					cancel()
++				}
++			}(ctx.Done(), cn.CloseNotify())
++		}
++		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
++		rctx, err := runtime.AnnotateContext(ctx, mux, req)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++		resp, md, err := request_Networks_Delete_0(rctx, inboundMarshaler, client, req, pathParams)
++		ctx = runtime.NewServerMetadataContext(ctx, md)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++
++		forward_Networks_Delete_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
++
++	})
++
++	mux.Handle("GET", pattern_Networks_ListFixed_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
++		ctx, cancel := context.WithCancel(req.Context())
++		defer cancel()
++		if cn, ok := w.(http.CloseNotifier); ok {
++			go func(done <-chan struct{}, closed <-chan bool) {
++				select {
++				case <-done:
++				case <-closed:
++					cancel()
++				}
++			}(ctx.Done(), cn.CloseNotify())
++		}
++		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
++		rctx, err := runtime.AnnotateContext(ctx, mux, req)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++		resp, md, err := request_Networks_ListFixed_0(rctx, inboundMarshaler, client, req, pathParams)
++		ctx = runtime.NewServerMetadataContext(ctx, md)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++
++		forward_Networks_ListFixed_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
++
++	})
++
++	mux.Handle("GET", pattern_Networks_List_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
++		ctx, cancel := context.WithCancel(req.Context())
++		defer cancel()
++		if cn, ok := w.(http.CloseNotifier); ok {
++			go func(done <-chan struct{}, closed <-chan bool) {
++				select {
++				case <-done:
++				case <-closed:
++					cancel()
++				}
++			}(ctx.Done(), cn.CloseNotify())
++		}
++		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
++		rctx, err := runtime.AnnotateContext(ctx, mux, req)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++		resp, md, err := request_Networks_List_0(rctx, inboundMarshaler, client, req, pathParams)
++		ctx = runtime.NewServerMetadataContext(ctx, md)
++		if err != nil {
++			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
++			return
++		}
++
++		forward_Networks_List_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
++
++	})
++
++	return nil
++}
++
++var (
++	pattern_Networks_Create_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0}, []string{"networks"}, ""))
++
++	pattern_Networks_Read_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 1, 0, 4, 1, 5, 1}, []string{"networks", "id.resource_id"}, ""))
++
++	pattern_Networks_Update_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 1, 0, 4, 1, 5, 1}, []string{"networks", "payload.id.resource_id"}, ""))
++
++	pattern_Networks_Delete_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 1, 0, 4, 1, 5, 1}, []string{"networks", "id.resource_id"}, ""))
++
++	pattern_Networks_ListFixed_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 1, 0, 4, 1, 5, 1, 2, 2}, []string{"networks", "id.resource_id", "fixed"}, ""))
++
++	pattern_Networks_List_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0}, []string{"networks"}, ""))
++)
++
++var (
++	forward_Networks_Create_0 = runtime.ForwardResponseMessage
++
++	forward_Networks_Read_0 = runtime.ForwardResponseMessage
++
++	forward_Networks_Update_0 = runtime.ForwardResponseMessage
++
++	forward_Networks_Delete_0 = runtime.ForwardResponseMessage
++
++	forward_Networks_ListFixed_0 = runtime.ForwardResponseMessage
++
++	forward_Networks_List_0 = runtime.ForwardResponseMessage
++)
+diff --git a/pkg/pb/contacts.pb.validate.go b/pkg/pb/contacts.pb.validate.go
+index ba0c734..5e9bb9f 100644
+--- a/pkg/pb/contacts.pb.validate.go
++++ b/pkg/pb/contacts.pb.validate.go
+@@ -2213,3 +2213,760 @@ func (e ListContactRequestValidationError) Error() string {
+ }
+ 
+ var _ error = ListContactRequestValidationError{}
++
++// Validate checks the field values on Network with the rules defined in the
++// proto definition for this message. If any rules are violated, an error is returned.
++func (m *Network) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetId()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return NetworkValidationError{
++				Field:  "Id",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	if ip := net.ParseIP(m.GetAddr()); ip == nil || ip.To4() == nil {
++		return NetworkValidationError{
++			Field:  "Addr",
++			Reason: "value must be a valid IPv4 address",
++		}
++	}
++
++	if val := m.GetCidr(); val < 0 || val > 32 {
++		return NetworkValidationError{
++			Field:  "Cidr",
++			Reason: "value must be inside range [0, 32]",
++		}
++	}
++
++	for idx, item := range m.GetFixed() {
++		_, _ = idx, item
++
++		if v, ok := interface{}(item).(interface {
++			Validate() error
++		}); ok {
++			if err := v.Validate(); err != nil {
++				return NetworkValidationError{
++					Field:  fmt.Sprintf("Fixed[%v]", idx),
++					Reason: "embedded message failed validation",
++					Cause:  err,
++				}
++			}
++		}
++
++	}
++
++	// no validation rules for Comment
++
++	return nil
++}
++
++// NetworkValidationError is the validation error returned by Network.Validate
++// if the designated constraints aren't met.
++type NetworkValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e NetworkValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sNetwork.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = NetworkValidationError{}
++
++// Validate checks the field values on StaticIP with the rules defined in the
++// proto definition for this message. If any rules are violated, an error is returned.
++func (m *StaticIP) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if ip := net.ParseIP(m.GetAddr()); ip == nil || ip.To4() == nil {
++		return StaticIPValidationError{
++			Field:  "Addr",
++			Reason: "value must be a valid IPv4 address",
++		}
++	}
++
++	return nil
++}
++
++// StaticIPValidationError is the validation error returned by
++// StaticIP.Validate if the designated constraints aren't met.
++type StaticIPValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e StaticIPValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sStaticIP.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = StaticIPValidationError{}
++
++// Validate checks the field values on CreateNetworkRequest with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *CreateNetworkRequest) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetPayload()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return CreateNetworkRequestValidationError{
++				Field:  "Payload",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// CreateNetworkRequestValidationError is the validation error returned by
++// CreateNetworkRequest.Validate if the designated constraints aren't met.
++type CreateNetworkRequestValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e CreateNetworkRequestValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sCreateNetworkRequest.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = CreateNetworkRequestValidationError{}
++
++// Validate checks the field values on CreateNetworkResponse with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *CreateNetworkResponse) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetResult()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return CreateNetworkResponseValidationError{
++				Field:  "Result",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// CreateNetworkResponseValidationError is the validation error returned by
++// CreateNetworkResponse.Validate if the designated constraints aren't met.
++type CreateNetworkResponseValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e CreateNetworkResponseValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sCreateNetworkResponse.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = CreateNetworkResponseValidationError{}
++
++// Validate checks the field values on ReadNetworkRequest with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *ReadNetworkRequest) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetId()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return ReadNetworkRequestValidationError{
++				Field:  "Id",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// ReadNetworkRequestValidationError is the validation error returned by
++// ReadNetworkRequest.Validate if the designated constraints aren't met.
++type ReadNetworkRequestValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e ReadNetworkRequestValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sReadNetworkRequest.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = ReadNetworkRequestValidationError{}
++
++// Validate checks the field values on ReadNetworkResponse with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *ReadNetworkResponse) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetResult()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return ReadNetworkResponseValidationError{
++				Field:  "Result",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// ReadNetworkResponseValidationError is the validation error returned by
++// ReadNetworkResponse.Validate if the designated constraints aren't met.
++type ReadNetworkResponseValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e ReadNetworkResponseValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sReadNetworkResponse.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = ReadNetworkResponseValidationError{}
++
++// Validate checks the field values on UpdateNetworkRequest with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *UpdateNetworkRequest) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetPayload()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return UpdateNetworkRequestValidationError{
++				Field:  "Payload",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// UpdateNetworkRequestValidationError is the validation error returned by
++// UpdateNetworkRequest.Validate if the designated constraints aren't met.
++type UpdateNetworkRequestValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e UpdateNetworkRequestValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sUpdateNetworkRequest.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = UpdateNetworkRequestValidationError{}
++
++// Validate checks the field values on UpdateNetworkResponse with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *UpdateNetworkResponse) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetResult()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return UpdateNetworkResponseValidationError{
++				Field:  "Result",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// UpdateNetworkResponseValidationError is the validation error returned by
++// UpdateNetworkResponse.Validate if the designated constraints aren't met.
++type UpdateNetworkResponseValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e UpdateNetworkResponseValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sUpdateNetworkResponse.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = UpdateNetworkResponseValidationError{}
++
++// Validate checks the field values on DeleteNetworkRequest with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *DeleteNetworkRequest) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetId()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return DeleteNetworkRequestValidationError{
++				Field:  "Id",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// DeleteNetworkRequestValidationError is the validation error returned by
++// DeleteNetworkRequest.Validate if the designated constraints aren't met.
++type DeleteNetworkRequestValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e DeleteNetworkRequestValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sDeleteNetworkRequest.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = DeleteNetworkRequestValidationError{}
++
++// Validate checks the field values on ListNetworksResponse with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *ListNetworksResponse) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	for idx, item := range m.GetResults() {
++		_, _ = idx, item
++
++		if v, ok := interface{}(item).(interface {
++			Validate() error
++		}); ok {
++			if err := v.Validate(); err != nil {
++				return ListNetworksResponseValidationError{
++					Field:  fmt.Sprintf("Results[%v]", idx),
++					Reason: "embedded message failed validation",
++					Cause:  err,
++				}
++			}
++		}
++
++	}
++
++	return nil
++}
++
++// ListNetworksResponseValidationError is the validation error returned by
++// ListNetworksResponse.Validate if the designated constraints aren't met.
++type ListNetworksResponseValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e ListNetworksResponseValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sListNetworksResponse.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = ListNetworksResponseValidationError{}
++
++// Validate checks the field values on ListNetworksRequest with the rules
++// defined in the proto definition for this message. If any rules are
++// violated, an error is returned.
++func (m *ListNetworksRequest) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetFilter()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return ListNetworksRequestValidationError{
++				Field:  "Filter",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	if v, ok := interface{}(m.GetOrderBy()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return ListNetworksRequestValidationError{
++				Field:  "OrderBy",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	if v, ok := interface{}(m.GetFields()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return ListNetworksRequestValidationError{
++				Field:  "Fields",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	if v, ok := interface{}(m.GetPaging()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return ListNetworksRequestValidationError{
++				Field:  "Paging",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// ListNetworksRequestValidationError is the validation error returned by
++// ListNetworksRequest.Validate if the designated constraints aren't met.
++type ListNetworksRequestValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e ListNetworksRequestValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sListNetworksRequest.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = ListNetworksRequestValidationError{}
++
++// Validate checks the field values on ListFixedResponse with the rules defined
++// in the proto definition for this message. If any rules are violated, an
++// error is returned.
++func (m *ListFixedResponse) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	return nil
++}
++
++// ListFixedResponseValidationError is the validation error returned by
++// ListFixedResponse.Validate if the designated constraints aren't met.
++type ListFixedResponseValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e ListFixedResponseValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sListFixedResponse.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = ListFixedResponseValidationError{}
++
++// Validate checks the field values on ListFixedRequest with the rules defined
++// in the proto definition for this message. If any rules are violated, an
++// error is returned.
++func (m *ListFixedRequest) Validate() error {
++	if m == nil {
++		return nil
++	}
++
++	if v, ok := interface{}(m.GetId()).(interface {
++		Validate() error
++	}); ok {
++		if err := v.Validate(); err != nil {
++			return ListFixedRequestValidationError{
++				Field:  "Id",
++				Reason: "embedded message failed validation",
++				Cause:  err,
++			}
++		}
++	}
++
++	return nil
++}
++
++// ListFixedRequestValidationError is the validation error returned by
++// ListFixedRequest.Validate if the designated constraints aren't met.
++type ListFixedRequestValidationError struct {
++	Field  string
++	Reason string
++	Cause  error
++	Key    bool
++}
++
++// Error satisfies the builtin error interface
++func (e ListFixedRequestValidationError) Error() string {
++	cause := ""
++	if e.Cause != nil {
++		cause = fmt.Sprintf(" | caused by: %v", e.Cause)
++	}
++
++	key := ""
++	if e.Key {
++		key = "key for "
++	}
++
++	return fmt.Sprintf(
++		"invalid %sListFixedRequest.%s: %s%s",
++		key,
++		e.Field,
++		e.Reason,
++		cause)
++}
++
++var _ error = ListFixedRequestValidationError{}
+diff --git a/pkg/pb/contacts.proto b/pkg/pb/contacts.proto
+index 30660d4..ab939f7 100644
+--- a/pkg/pb/contacts.proto
++++ b/pkg/pb/contacts.proto
+@@ -322,6 +322,118 @@ service Contacts {
+     }
+ }
+ 
++message Network {
++    option (gorm.opts) = {
++        ormable: true,
++        multi_account: true
++    };
++    atlas.rpc.Identifier id = 1 [(gorm.field).tag = {type: "serial"  primary_key: true}];
++    string addr = 2 [(validate.rules).string.ipv4 = true];
++    int32 cidr = 3 [(validate.rules).int32 = {gte:0, lte:32}];
++    repeated StaticIP fixed = 4;
++    string comment = 5;
++}
++
++message StaticIP {
++    option (gorm.opts) = {
++        ormable: true,
++        multi_account: true
++    };
++    string addr = 1 [(validate.rules).string.ipv4 = true];
++}
++
++message CreateNetworkRequest {
++    Network payload = 1;
++}
++
++message CreateNetworkResponse {
++    Network result = 1;
++}
++
++message ReadNetworkRequest {
++    atlas.rpc.Identifier id = 1;
++}
++
++message ReadNetworkResponse {
++    Network result = 1;
++}
++
++message UpdateNetworkRequest {
++    Network payload = 1;
++}
++
++message UpdateNetworkResponse {
++    Network result = 1;
++}
++
++message DeleteNetworkRequest {
++    atlas.rpc.Identifier id = 1;
++}
++
++message ListNetworksResponse {
++    repeated Network results = 1;
++}
++
++message ListNetworksRequest {
++    infoblox.api.Filtering filter = 1;
++    infoblox.api.Sorting order_by = 2;
++    infoblox.api.FieldSelection fields = 3;
++    infoblox.api.Pagination paging = 4;
++}
++
++message ListFixedResponse {
++    repeated string results = 1;
++}
++
++message ListFixedRequest {
++    atlas.rpc.Identifier id = 1;
++}
++
++
++service Networks {
++    option (gorm.server).autogen = true;
++    rpc Create (CreateNetworkRequest) returns (CreateNetworkResponse) {
++        option (google.api.http) = {
++            post: "/networks"
++            body: "payload"
++        };
++    }
++
++    rpc Read (ReadNetworkRequest) returns (ReadNetworkResponse) {
++        option (google.api.http) = {
++            get: "/networks/{id.resource_id}"
++        };
++    }
++
++    rpc Update (UpdateNetworkRequest) returns (UpdateNetworkResponse) {
++        option (google.api.http) = {
++            put: "/networks/{payload.id.resource_id}"
++            body: "payload"
++        };
++    }
++
++    rpc Delete (DeleteNetworkRequest) returns (google.protobuf.Empty) {
++        option (google.api.http) = {
++            delete: "/networks/{id.resource_id}"
++        };
++        option (gorm.method).object_type = "Network";
++    }
++
++    rpc ListFixed (ListFixedRequest) returns (ListFixedResponse){
++        option (google.api.http) = {
++            get: "/networks/{id.resource_id}/fixed"
++        };
++    }
++
++    rpc List (ListNetworksRequest) returns (ListNetworksResponse) {
++        option (google.api.http) = {
++            get: "/networks"
++        };
++    }
++
++}
++
++
+ option (grpc.gateway.protoc_gen_swagger.options.openapiv2_swagger) = {
+   info: {
+     title: "Contacts";
+diff --git a/pkg/svc/zserver.go b/pkg/svc/zserver.go
+index f834e15..75a5973 100644
+--- a/pkg/svc/zserver.go
++++ b/pkg/svc/zserver.go
+@@ -48,6 +48,15 @@ type contactsServer struct {
+ 	*pb.ContactsDefaultServer
+ }
+ 
++// NewNetworksServer returns an instance of the default contacts server interface
++func NewNetworksServer(database *gorm.DB) (pb.NetworksServer, error) {
++	return &networksServer{&pb.NetworksDefaultServer{DB: database}}, nil
++}
++
++type networksServer struct {
++	*pb.NetworksDefaultServer
++}
++
+ // List wraps default ContactsDefaultServer.List implementation by adding
+ // application specific page token implementation.
+ // Actually the service supports "composite" pagination in a specific way:

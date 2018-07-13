@@ -48,6 +48,15 @@ type contactsServer struct {
 	*pb.ContactsDefaultServer
 }
 
+// NewNetworksServer returns an instance of the default contacts server interface
+func NewNetworksServer(database *gorm.DB) (pb.NetworksServer, error) {
+	return &networksServer{&pb.NetworksDefaultServer{DB: database}}, nil
+}
+
+type networksServer struct {
+	*pb.NetworksDefaultServer
+}
+
 // List wraps default ContactsDefaultServer.List implementation by adding
 // application specific page token implementation.
 // Actually the service supports "composite" pagination in a specific way:

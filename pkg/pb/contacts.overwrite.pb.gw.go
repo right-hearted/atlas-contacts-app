@@ -35,5 +35,15 @@ func init() {
 
 	forward_Contacts_List_0 = gateway.ForwardResponseMessage
 
-	forward_Contacts_SendSMS_0 = gateway.ForwardResponseMessage
+	forward_Networks_Create_0 = gateway.ForwardResponseMessage
+
+	forward_Networks_Read_0 = gateway.ForwardResponseMessage
+
+	forward_Networks_Update_0 = gateway.ForwardResponseMessage
+
+	forward_Networks_Delete_0 = gateway.ForwardResponseMessage
+
+	forward_Networks_List_0 = gateway.ForwardResponseMessage
+
+	forward_Networks_ListFixed_0 = gateway.ForwardResponseMessage
 }

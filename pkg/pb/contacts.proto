@@ -322,6 +322,118 @@ service Contacts {
     }
 }
 
+message Network {
+    option (gorm.opts) = {
+        ormable: true,
+        multi_account: true
+    };
+    atlas.rpc.Identifier id = 1 [(gorm.field).tag = {type: "serial"  primary_key: true}];
+    string addr = 2 [(validate.rules).string.ipv4 = true];
+    int32 cidr = 3 [(validate.rules).int32 = {gte:0, lte:32}];
+    repeated StaticIP fixed = 4;
+    string comment = 5;
+}
+
+message StaticIP {
+    option (gorm.opts) = {
+        ormable: true,
+        multi_account: true
+    };
+    string addr = 1 [(validate.rules).string.ipv4 = true];
+}
+
+message CreateNetworkRequest {
+    Network payload = 1;
+}
+
+message CreateNetworkResponse {
+    Network result = 1;
+}
+
+message ReadNetworkRequest {
+    atlas.rpc.Identifier id = 1;
+}
+
+message ReadNetworkResponse {
+    Network result = 1;
+}
+
+message UpdateNetworkRequest {
+    Network payload = 1;
+}
+
+message UpdateNetworkResponse {
+    Network result = 1;
+}
+
+message DeleteNetworkRequest {
+    atlas.rpc.Identifier id = 1;
+}
+
+message ListNetworksResponse {
+    repeated Network results = 1;
+}
+
+message ListNetworksRequest {
+    infoblox.api.Filtering filter = 1;
+    infoblox.api.Sorting order_by = 2;
+    infoblox.api.FieldSelection fields = 3;
+    infoblox.api.Pagination paging = 4;
+}
+
+message ListFixedResponse {
+    repeated string results = 1;
+}
+
+message ListFixedRequest {
+    atlas.rpc.Identifier id = 1;
+}
+
+
+service Networks {
+    option (gorm.server).autogen = true;
+    rpc Create (CreateNetworkRequest) returns (CreateNetworkResponse) {
+        option (google.api.http) = {
+            post: "/networks"
+            body: "payload"
+        };
+    }
+
+    rpc Read (ReadNetworkRequest) returns (ReadNetworkResponse) {
+        option (google.api.http) = {
+            get: "/networks/{id.resource_id}"
+        };
+    }
+
+    rpc Update (UpdateNetworkRequest) returns (UpdateNetworkResponse) {
+        option (google.api.http) = {
+            put: "/networks/{payload.id.resource_id}"
+            body: "payload"
+        };
+    }
+
+    rpc Delete (DeleteNetworkRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            delete: "/networks/{id.resource_id}"
+        };
+        option (gorm.method).object_type = "Network";
+    }
+
+    rpc ListFixed (ListFixedRequest) returns (ListFixedResponse){
+        option (google.api.http) = {
+            get: "/networks/{id.resource_id}/fixed"
+        };
+    }
+
+    rpc List (ListNetworksRequest) returns (ListNetworksResponse) {
+        option (google.api.http) = {
+            get: "/networks"
+        };
+    }
+
+}
+
+
 option (grpc.gateway.protoc_gen_swagger.options.openapiv2_swagger) = {
   info: {
     title: "Contacts";

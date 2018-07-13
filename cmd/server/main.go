@@ -137,14 +137,14 @@ func ServeExternal(logger *logrus.Logger) error {
 			// solution that uses database migration files.
 			logger.Debug("migrating database...")
 			defer logger.Debug("finished migrating database")
-			return db.AutoMigrate(&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{}).Error
+			return db.AutoMigrate(&pb.ProfileORM{}, &pb.GroupORM{}, &pb.ContactORM{}, &pb.AddressORM{}, &pb.EmailORM{}, &pb.NetworkORM{}, &pb.StaticIPORM{}).Error
 		}),
 		// register our grpc server
 		server.WithGrpcServer(grpcServer),
 		// register the gateway to proxy to the given server address with the service registration endpoints
 		server.WithGateway(
 			gateway.WithServerAddress(ServerAddress),
-			gateway.WithEndpointRegistration("/v1/", pb.RegisterProfilesHandlerFromEndpoint, pb.RegisterGroupsHandlerFromEndpoint, pb.RegisterContactsHandlerFromEndpoint),
+			gateway.WithEndpointRegistration("/v1/", pb.RegisterProfilesHandlerFromEndpoint, pb.RegisterGroupsHandlerFromEndpoint, pb.RegisterContactsHandlerFromEndpoint, pb.RegisterNetworksHandlerFromEndpoint),
 		),
 		// serve swagger at the root
 		server.WithHandler("/swagger", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

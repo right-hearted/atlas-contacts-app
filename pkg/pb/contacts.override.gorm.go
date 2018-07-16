@@ -159,7 +159,9 @@ func (m *ContactsDefaultServer) CustomList(ctx context.Context, in *ListContactR
 func (m *NetworksDefaultServer) CustomListFixed(ctx context.Context, req *ListFixedRequest) (*ListFixedResponse, error) {
 	res := []*IPv4{}
 	id := fmt.Sprintf("%v", req.Id)
-	m.DB.Where("network_id = ?", id).Find(&res)
+	if err := m.DB.Where("network_id = ?", id).Find(&res).Error; err != nil {
+		return nil, err
+	}
 	return &ListFixedResponse{Results: res}, nil
 }
 
